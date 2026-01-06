@@ -1,0 +1,136 @@
+name: Python Publish (CUDA)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish to PyPI'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-cuda-wheels:
+    name: Build CUDA ${{ matrix.cuda }} wheels
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda: ['11.8', '12.4']
+        include:
+          - cuda: '11.8'
+            cuda_tag: '11.8.0'
+            cuda_suffix: 'cu118'
+          - cuda: '12.4'
+            cuda_tag: '12.4.0'
+            cuda_suffix: 'cu124'
+
+    container:
+      image: nvidia/cuda:${{ matrix.cuda_tag }}-devel-ubuntu22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y curl build-essential pkg-config libssl-dev
+
+      - name: Install Python
+        run: |
+          apt-get install -y python3.12 python3.12-venv python3.12-dev python3-pip
+          python3.12 -m pip install --upgrade pip
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install maturin
+        run: python3.12 -m pip install maturin[patchelf]
+
+      - name: Build CUDA wheel
+        run: |
+          source $HOME/.cargo/env
+          maturin build --release --features python,models-cuda -o dist
+        env:
+          CUDA_VERSION: ${{ matrix.cuda }}
+
+      - name: Rename wheel with CUDA suffix
+        run: |
+          cd dist
+          for f in *.whl; do
+            # Add CUDA version suffix to wheel name
+            # e.g., sahi_rs-0.1.0-cp312-...-linux_x86_64.whl
+            # becomes sahi_rs-0.1.0+cu124-cp312-...-linux_x86_64.whl
+            newname=$(echo "$f" | sed "s/\(-[0-9]\+\.[0-9]\+\.[0-9]\+\)-/\1+${{ matrix.cuda_suffix }}-/")
+            if [ "$f" != "$newname" ]; then
+              mv "$f" "$newname"
+              echo "Renamed: $f -> $newname"
+            fi
+          done
+
+      - name: Upload CUDA wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-cuda-${{ matrix.cuda_suffix }}
+          path: dist/*.whl
+
+  publish-cuda:
+    name: Publish CUDA wheels to PyPI
+    needs: [build-cuda-wheels]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish)
+
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download all CUDA artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: wheels-cuda-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          skip-existing: true
+
+  test-cuda-install:
+    name: Test CUDA installation
+    needs: [build-cuda-wheels]
+    runs-on: ubuntu-latest
+    # Note: This tests that the wheel installs, not that CUDA works (no GPU in CI)
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download CUDA wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels-cuda-cu124
+          path: dist
+
+      - name: Install wheel
+        run: |
+          pip install numpy
+          pip install dist/*.whl
+
+      - name: Test import
+        run: |
+          python -c "from sahi import Sahi, BoundingBox, Detection; print('Core import OK')"
+          python -c "from sahi import has_onnx, has_cuda; print(f'ONNX: {has_onnx()}, CUDA build: True')"

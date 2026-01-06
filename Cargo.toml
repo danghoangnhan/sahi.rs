@@ -1,0 +1,51 @@
+[package]
+name = "sahi"
+version = "0.1.0"
+edition = "2021"
+description = "Slicing Aided Hyper Inference - Rust implementation"
+license = "MIT"
+
+[dependencies]
+# Core
+thiserror = "2.0"
+
+# Optional GPU acceleration (for direct CUDA kernels)
+cudarc = { version = "0.12", optional = true }
+
+# Optional Python bindings
+pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
+numpy = { version = "0.23", optional = true }
+
+# ONNX Runtime for model inference
+ort = { version = "2.0.0-rc.10", optional = true }
+ndarray = { version = "0.16", optional = true }
+
+# Image processing for built-in models
+image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg"] }
+
+[features]
+default = []
+
+# Existing features
+cuda = ["dep:cudarc"]
+python = ["dep:pyo3", "dep:numpy"]
+
+# ONNX Runtime features
+onnx = ["dep:ort", "dep:ndarray"]
+onnx-cuda = ["onnx", "ort/cuda"]
+onnx-tensorrt = ["onnx", "ort/tensorrt"]
+
+# Image processing for built-in preprocessing
+image-processing = ["dep:image"]
+
+# Full model support (ONNX + image processing)
+models = ["onnx", "image-processing"]
+models-cuda = ["models", "onnx-cuda"]
+models-tensorrt = ["models", "onnx-tensorrt"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[example]]
+name = "basic"
+path = "examples/rust/basic.rs"
