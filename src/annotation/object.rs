@@ -91,8 +91,7 @@ impl ObjectAnnotation {
             final_bbox[3].min(full_shape.height as f32),
         ];
 
-        let ann_bbox =
-            AnnotationBoundingBox::from_voc(clipped).with_shift(shift[0], shift[1]);
+        let ann_bbox = AnnotationBoundingBox::from_voc(clipped).with_shift(shift[0], shift[1]);
 
         let name = category_name
             .map(|n| n.to_string())
@@ -116,7 +115,14 @@ impl ObjectAnnotation {
     ) -> Self {
         // Convert COCO to VOC format
         let voc = [bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1] + bbox[3]];
-        Self::new(voc, category_id, category_name, None, full_shape, shift_amount)
+        Self::new(
+            voc,
+            category_id,
+            category_name,
+            None,
+            full_shape,
+            shift_amount,
+        )
     }
 
     /// Create from COCO segmentation format.
@@ -467,8 +473,8 @@ mod tests {
         let voc = ann.to_voc_bbox();
         assert_eq!(voc[0], 10.0);
         assert_eq!(voc[1], 20.0);
-        assert_eq!(voc[2], 60.0);  // x + w
-        assert_eq!(voc[3], 80.0);  // y + h
+        assert_eq!(voc[2], 60.0); // x + w
+        assert_eq!(voc[3], 80.0); // y + h
     }
 
     #[test]
@@ -525,14 +531,7 @@ mod tests {
 
     #[test]
     fn test_annotation_area() {
-        let ann = ObjectAnnotation::new(
-            [0.0, 0.0, 10.0, 10.0],
-            0,
-            None,
-            None,
-            [100, 100],
-            None,
-        );
+        let ann = ObjectAnnotation::new([0.0, 0.0, 10.0, 10.0], 0, None, None, [100, 100], None);
 
         // Without mask, uses bbox area
         assert_eq!(ann.area(), 100.0);
@@ -574,8 +573,8 @@ mod tests {
         );
 
         let bbox = ann.to_voc_bbox();
-        assert_eq!(bbox[0], 0.0);   // Clipped to 0
-        assert_eq!(bbox[1], 0.0);   // Clipped to 0
+        assert_eq!(bbox[0], 0.0); // Clipped to 0
+        assert_eq!(bbox[1], 0.0); // Clipped to 0
         assert_eq!(bbox[2], 640.0); // Clipped to width
         assert_eq!(bbox[3], 480.0); // Clipped to height
     }

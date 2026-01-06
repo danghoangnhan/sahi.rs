@@ -42,12 +42,7 @@ fn basic_usage() {
     let mock_model = callback(|img: &ImageData| {
         // Simulate finding a small object in each slice
         let det = Detection::new(
-            BoundingBox::new(
-                img.width as f32 * 0.3,
-                img.height as f32 * 0.3,
-                50.0,
-                50.0,
-            ),
+            BoundingBox::new(img.width as f32 * 0.3, img.height as f32 * 0.3, 50.0, 50.0),
             0, // class_id: "person"
             0.85,
             Some("person".to_string()),
@@ -93,12 +88,26 @@ fn demo_postprocess_types() {
     // Callback that returns overlapping detections to show postprocessing differences
     let detector_with_overlaps = callback(|_img: &ImageData| {
         Ok(vec![
-            Detection::new(BoundingBox::new(100.0, 100.0, 200.0, 200.0), 0, 0.9, Some("obj".to_string())),
-            Detection::new(BoundingBox::new(150.0, 150.0, 200.0, 200.0), 0, 0.8, Some("obj".to_string())), // Overlapping
+            Detection::new(
+                BoundingBox::new(100.0, 100.0, 200.0, 200.0),
+                0,
+                0.9,
+                Some("obj".to_string()),
+            ),
+            Detection::new(
+                BoundingBox::new(150.0, 150.0, 200.0, 200.0),
+                0,
+                0.8,
+                Some("obj".to_string()),
+            ), // Overlapping
         ])
     });
 
-    for pp_type in [PostprocessType::NMS, PostprocessType::NMM, PostprocessType::GREEDYNMM] {
+    for pp_type in [
+        PostprocessType::NMS,
+        PostprocessType::NMM,
+        PostprocessType::GREEDYNMM,
+    ] {
         let sahi = Sahi::builder()
             .slice_size(640, 640)
             .postprocess_type(pp_type)

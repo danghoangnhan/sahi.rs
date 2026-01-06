@@ -48,8 +48,8 @@ pub use processor::{YOLOv8OutputFormat, YOLOv8Processor};
 
 #[cfg(feature = "python")]
 mod python {
-    use pyo3::prelude::*;
     use numpy::{PyArray3, PyArrayMethods, PyUntypedArrayMethods};
+    use pyo3::prelude::*;
 
     use crate::detection::Detection;
     use crate::inference::ImageData;
@@ -204,22 +204,24 @@ mod python {
             "cuda" => Ok(ExecutionProvider::cuda()),
             #[cfg(feature = "onnx-cuda")]
             _ if device.starts_with("cuda:") => {
-                let idx: i32 = device[5..]
-                    .parse()
-                    .map_err(|_| pyo3::exceptions::PyValueError::new_err(
-                        format!("Invalid CUDA device index: {}", device)
-                    ))?;
+                let idx: i32 = device[5..].parse().map_err(|_| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "Invalid CUDA device index: {}",
+                        device
+                    ))
+                })?;
                 Ok(ExecutionProvider::cuda_with_device(idx))
             }
             #[cfg(not(feature = "onnx-cuda"))]
             "cuda" | _ if device.starts_with("cuda:") => {
                 Err(pyo3::exceptions::PyValueError::new_err(
-                    "CUDA support not enabled. Rebuild with --features onnx-cuda"
+                    "CUDA support not enabled. Rebuild with --features onnx-cuda",
                 ))
             }
-            _ => Err(pyo3::exceptions::PyValueError::new_err(
-                format!("Unknown device: {}", device)
-            )),
+            _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Unknown device: {}",
+                device
+            ))),
         }
     }
 }

@@ -30,12 +30,12 @@
 //! let detections = detector.predict(&image)?;
 //! ```
 
-mod session;
 mod processor;
+mod session;
 pub mod yolov8;
 
-pub use session::{ExecutionProvider, OnnxSession, OnnxSessionBuilder};
 pub use processor::{ImageProcessor, LetterboxInfo, Preprocessor};
+pub use session::{ExecutionProvider, OnnxSession, OnnxSessionBuilder};
 pub use yolov8::{YOLOv8Config, YOLOv8Detector};
 
 #[cfg(feature = "python")]

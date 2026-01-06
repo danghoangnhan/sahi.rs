@@ -214,10 +214,7 @@ impl DetectionModel for YOLOv8Detector {
 
     fn predict(&self, image: &ImageData) -> Result<Vec<Detection>> {
         // Lock the session for mutable access
-        let session_mutex = self
-            .session
-            .as_ref()
-            .ok_or(Error::ModelNotLoaded)?;
+        let session_mutex = self.session.as_ref().ok_or(Error::ModelNotLoaded)?;
 
         let mut session = session_mutex
             .lock()
@@ -227,13 +224,15 @@ impl DetectionModel for YOLOv8Detector {
         let (input_tensor, letterbox_info) = self.processor.preprocessor.preprocess(image)?;
 
         // Get input name (from immutable access)
-        let input_name = session.input_name().ok_or_else(|| {
-            Error::invalid_output("Model has no input".to_string())
-        })?.to_string();
+        let input_name = session
+            .input_name()
+            .ok_or_else(|| Error::invalid_output("Model has no input".to_string()))?
+            .to_string();
 
-        let output_name = session.output_name().ok_or_else(|| {
-            Error::invalid_output("Model has no output".to_string())
-        })?.to_string();
+        let output_name = session
+            .output_name()
+            .ok_or_else(|| Error::invalid_output("Model has no output".to_string()))?
+            .to_string();
 
         // Create ONNX input - need owned array
         let input_array = input_tensor.into_dyn();
@@ -242,12 +241,14 @@ impl DetectionModel for YOLOv8Detector {
         let ort_input = ort::value::Tensor::from_array(input_array)?;
 
         // Run inference using the mutable session
-        let outputs = session.session_mut().run(ort::inputs![&input_name => ort_input])?;
+        let outputs = session
+            .session_mut()
+            .run(ort::inputs![&input_name => ort_input])?;
 
         // Get output
-        let output_value = outputs.get(&output_name).ok_or_else(|| {
-            Error::invalid_output(format!("Output '{}' not found", output_name))
-        })?;
+        let output_value = outputs
+            .get(&output_name)
+            .ok_or_else(|| Error::invalid_output(format!("Output '{}' not found", output_name)))?;
 
         // Extract tensor data - try_extract_tensor returns (Shape, &[T])
         let (output_shape, output_data) = output_value.try_extract_tensor::<f32>()?;

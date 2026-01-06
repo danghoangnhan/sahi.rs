@@ -212,7 +212,6 @@ impl std::str::FromStr for Device {
     }
 }
 
-
 // ============================================================================
 // Category Mapping
 // ============================================================================
@@ -659,7 +658,8 @@ impl PredictionBuffer {
     /// Reserve capacity based on estimate.
     pub fn reserve(&mut self) {
         if self.detections.capacity() < self.estimated_capacity {
-            self.detections.reserve(self.estimated_capacity - self.detections.len());
+            self.detections
+                .reserve(self.estimated_capacity - self.detections.len());
         }
     }
 

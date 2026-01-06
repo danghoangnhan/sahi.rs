@@ -44,16 +44,16 @@ pub mod detection;
 pub mod error;
 pub mod inference;
 pub mod model;
-pub mod slicer;
 pub mod postprocess;
+pub mod slicer;
 
 // ONNX Runtime support (feature-gated)
 #[cfg(feature = "onnx")]
 pub mod onnx;
 
-pub use backend::{Backend, BoxedBackend, CpuBackend};
 #[cfg(feature = "cuda")]
 pub use backend::CudaBackend;
+pub use backend::{Backend, BoxedBackend, CpuBackend};
 
 // ONNX exports
 #[cfg(feature = "onnx")]
@@ -75,8 +75,8 @@ pub use annotation::{
     AnnotationBoundingBox, FullShape, Mask, MaskFormat, ObjectAnnotation, Polygon, RleData,
 };
 
-pub use slicer::{Slice, Slicer, SlicerConfig};
 pub use postprocess::{MatchMetric, PostprocessConfig, PostprocessType, Postprocessor};
+pub use slicer::{Slice, Slicer, SlicerConfig};
 
 /// High-level SAHI interface.
 ///
@@ -310,10 +310,7 @@ mod tests {
 
     #[test]
     fn test_sahi_predict() {
-        let sahi = Sahi::builder()
-            .slice_size(50, 50)
-            .overlap(0.0, 0.0)
-            .build();
+        let sahi = Sahi::builder().slice_size(50, 50).overlap(0.0, 0.0).build();
 
         // 100x100 image = 4 slices with 50x50 slice size
         let image = ImageData::from_rgb(vec![0; 30000], 100, 100);
@@ -492,7 +489,11 @@ mod python {
                 // Convert ImageData to numpy array
                 let array = numpy::PyArray::from_slice(py, &image.data);
                 let reshaped = array
-                    .reshape([image.height as usize, image.width as usize, image.channels as usize])
+                    .reshape([
+                        image.height as usize,
+                        image.width as usize,
+                        image.channels as usize,
+                    ])
                     .map_err(|e| Error::Inference(e.to_string()))?;
 
                 // Call the Python callback

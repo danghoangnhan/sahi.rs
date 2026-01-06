@@ -338,10 +338,7 @@ mod tests {
 
     #[test]
     fn test_execution_provider_from_device() {
-        assert_eq!(
-            ExecutionProvider::from(Device::Cpu),
-            ExecutionProvider::Cpu
-        );
+        assert_eq!(ExecutionProvider::from(Device::Cpu), ExecutionProvider::Cpu);
     }
 
     #[test]

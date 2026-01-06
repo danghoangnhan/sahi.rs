@@ -1,7 +1,7 @@
 //! CUDA backend for GPU-accelerated slice processing.
 
-use cudarc::driver::{CudaDevice, CudaSlice, DeviceRepr, LaunchAsync, LaunchConfig};
 use cudarc::driver::result::DriverError;
+use cudarc::driver::{CudaDevice, CudaSlice, DeviceRepr, LaunchAsync, LaunchConfig};
 use std::sync::Arc;
 
 use crate::backend::Backend;
@@ -64,7 +64,10 @@ impl CudaBackend {
 
     /// Upload image data to GPU.
     pub fn upload_image(&self, image: &ImageData) -> Result<CudaSlice<u8>> {
-        let device = self.device.as_ref().ok_or_else(|| Error::gpu("CUDA not initialized"))?;
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| Error::gpu("CUDA not initialized"))?;
 
         device
             .htod_copy(image.data.clone())
@@ -73,7 +76,10 @@ impl CudaBackend {
 
     /// Download data from GPU.
     pub fn download<T: DeviceRepr + Clone>(&self, slice: &CudaSlice<T>) -> Result<Vec<T>> {
-        let device = self.device.as_ref().ok_or_else(|| Error::gpu("CUDA not initialized"))?;
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| Error::gpu("CUDA not initialized"))?;
 
         device
             .dtoh_sync_copy(slice)

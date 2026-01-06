@@ -122,10 +122,7 @@ impl Polygon {
 
     /// Create from pairs of (x, y) coordinates.
     pub fn from_pairs(pairs: impl IntoIterator<Item = (f32, f32)>) -> Self {
-        let points: Vec<f32> = pairs
-            .into_iter()
-            .flat_map(|(x, y)| [x, y])
-            .collect();
+        let points: Vec<f32> = pairs.into_iter().flat_map(|(x, y)| [x, y]).collect();
         Self { points }
     }
 
@@ -332,10 +329,7 @@ impl Mask {
             .iter()
             .map(|polygon| {
                 let shifted = polygon.shift(self.shift_x, self.shift_y);
-                shifted.clip(
-                    self.full_shape.width as f32,
-                    self.full_shape.height as f32,
-                )
+                shifted.clip(self.full_shape.width as f32, self.full_shape.height as f32)
             })
             .collect();
 
@@ -549,7 +543,10 @@ mod tests {
     fn test_polygon_from_pairs() {
         let polygon = Polygon::from_pairs([(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]);
         assert_eq!(polygon.num_vertices(), 4);
-        assert_eq!(polygon.points, vec![0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0]);
+        assert_eq!(
+            polygon.points,
+            vec![0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0]
+        );
     }
 
     #[test]

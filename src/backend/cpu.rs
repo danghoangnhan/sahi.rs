@@ -68,11 +68,7 @@ impl Backend for CpuBackend {
         let detections = callback.infer_batch(&slice_images)?;
 
         // Pair slices with their detections
-        Ok(slices
-            .iter()
-            .copied()
-            .zip(detections)
-            .collect())
+        Ok(slices.iter().copied().zip(detections).collect())
     }
 
     fn name(&self) -> &'static str {
@@ -102,10 +98,7 @@ mod tests {
     fn test_process_slices() {
         let backend = CpuBackend::new();
         let image = ImageData::from_rgb(vec![0; 300], 10, 10);
-        let slices = vec![
-            Slice::new(0, 0, 5, 5, 0),
-            Slice::new(5, 5, 5, 5, 1),
-        ];
+        let slices = vec![Slice::new(0, 0, 5, 5, 0), Slice::new(5, 5, 5, 5, 1)];
 
         let cb = callback(|_img: &ImageData| {
             Ok(vec![Detection::new(

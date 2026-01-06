@@ -21,7 +21,12 @@ pub struct Detection {
 
 impl Detection {
     /// Create a new detection.
-    pub fn new(bbox: BoundingBox, class_id: u32, confidence: f32, class_name: Option<String>) -> Self {
+    pub fn new(
+        bbox: BoundingBox,
+        class_id: u32,
+        confidence: f32,
+        class_name: Option<String>,
+    ) -> Self {
         Self {
             bbox,
             class_id,
@@ -52,7 +57,12 @@ impl Detection {
 impl Detection {
     #[new]
     #[pyo3(signature = (bbox, class_id, confidence, class_name=None))]
-    fn py_new(bbox: BoundingBox, class_id: u32, confidence: f32, class_name: Option<String>) -> Self {
+    fn py_new(
+        bbox: BoundingBox,
+        class_id: u32,
+        confidence: f32,
+        class_name: Option<String>,
+    ) -> Self {
         Self::new(bbox, class_id, confidence, class_name)
     }
 

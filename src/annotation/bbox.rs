@@ -32,7 +32,12 @@ impl BoundingBox {
     /// Create a new bounding box.
     #[inline]
     pub fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
-        Self { x, y, width, height }
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     /// Create from corner coordinates (x1, y1, x2, y2) / VOC format.
@@ -186,10 +191,7 @@ impl BoundingBox {
     /// Check if this box fully contains another box.
     #[inline]
     pub fn contains_box(&self, other: &BoundingBox) -> bool {
-        self.x <= other.x
-            && self.y <= other.y
-            && self.x2() >= other.x2()
-            && self.y2() >= other.y2()
+        self.x <= other.x && self.y <= other.y && self.x2() >= other.x2() && self.y2() >= other.y2()
     }
 
     /// Get the intersection with another box, if any.

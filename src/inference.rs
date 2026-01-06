@@ -25,7 +25,12 @@ pub struct ImageData {
 impl ImageData {
     /// Create new image data.
     pub fn new(data: Vec<u8>, width: u32, height: u32, channels: u32) -> Self {
-        Self { data, width, height, channels }
+        Self {
+            data,
+            width,
+            height,
+            channels,
+        }
     }
 
     /// Create from raw RGB bytes.
@@ -86,7 +91,11 @@ impl ImageData {
     pub fn to_numpy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray3<u8>>> {
         use numpy::PyArray;
         let array = PyArray::from_slice(py, &self.data);
-        let reshaped = array.reshape([self.height as usize, self.width as usize, self.channels as usize])?;
+        let reshaped = array.reshape([
+            self.height as usize,
+            self.width as usize,
+            self.channels as usize,
+        ])?;
         Ok(reshaped)
     }
 

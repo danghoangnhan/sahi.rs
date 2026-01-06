@@ -167,7 +167,11 @@ impl Preprocessor {
 
         // Create output array filled with padding value
         let mut output = Array3::<u8>::from_elem(
-            (target_h as usize, target_w as usize, image.channels as usize),
+            (
+                target_h as usize,
+                target_w as usize,
+                image.channels as usize,
+            ),
             self.pad_value,
         );
 
@@ -211,11 +215,7 @@ impl Preprocessor {
             for y in 0..h {
                 for x in 0..w {
                     let value = chw[[c_idx, y, x]] as f32;
-                    output[[0, c_idx, y, x]] = if self.normalize {
-                        value / 255.0
-                    } else {
-                        value
-                    };
+                    output[[0, c_idx, y, x]] = if self.normalize { value / 255.0 } else { value };
                 }
             }
         }

@@ -18,7 +18,13 @@ pub struct Slice {
 impl Slice {
     /// Create a new slice.
     pub fn new(x: u32, y: u32, width: u32, height: u32, index: usize) -> Self {
-        Self { x, y, width, height, index }
+        Self {
+            x,
+            y,
+            width,
+            height,
+            index,
+        }
     }
 }
 
@@ -85,10 +91,10 @@ impl Slicer {
     pub fn slice(&self, image_width: u32, image_height: u32) -> Vec<Slice> {
         let mut slices: Vec<Slice> = Vec::new();
 
-        let step_x = (self.config.slice_width as f32
-            * (1.0 - self.config.overlap_width_ratio)) as u32;
-        let step_y = (self.config.slice_height as f32
-            * (1.0 - self.config.overlap_height_ratio)) as u32;
+        let step_x =
+            (self.config.slice_width as f32 * (1.0 - self.config.overlap_width_ratio)) as u32;
+        let step_y =
+            (self.config.slice_height as f32 * (1.0 - self.config.overlap_height_ratio)) as u32;
 
         // Ensure we have at least 1 pixel step
         let step_x = step_x.max(1);
