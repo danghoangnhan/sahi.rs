@@ -13,7 +13,6 @@ pub struct CpuBackendConfig {
     pub num_threads: usize,
 }
 
-
 /// CPU backend for slice processing.
 #[derive(Debug)]
 pub struct CpuBackend {
