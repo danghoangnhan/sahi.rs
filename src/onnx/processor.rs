@@ -283,6 +283,7 @@ pub fn nms(
 }
 
 /// Compute IoU between two boxes in XYWH format.
+#[allow(clippy::too_many_arguments)]
 fn compute_iou(x1: f32, y1: f32, w1: f32, h1: f32, x2: f32, y2: f32, w2: f32, h2: f32) -> f32 {
     // Convert to corner format
     let x1_min = x1;

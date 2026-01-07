@@ -213,7 +213,7 @@ mod python {
                 Ok(ExecutionProvider::cuda_with_device(idx))
             }
             #[cfg(not(feature = "onnx-cuda"))]
-            "cuda" | _ if device.starts_with("cuda:") => {
+            _ if device == "cuda" || device.starts_with("cuda:") => {
                 Err(pyo3::exceptions::PyValueError::new_err(
                     "CUDA support not enabled. Rebuild with --features onnx-cuda",
                 ))

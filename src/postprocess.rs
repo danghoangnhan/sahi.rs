@@ -178,7 +178,7 @@ impl Postprocessor {
     /// Apply Non-Maximum Suppression to a list of detections.
     ///
     /// Removes overlapping boxes, keeping only the one with highest confidence.
-    pub fn nms(&self, detections: &mut Vec<Detection>) -> Vec<Detection> {
+    pub fn nms(&self, detections: &mut [Detection]) -> Vec<Detection> {
         if detections.is_empty() {
             return Vec::new();
         }
@@ -224,7 +224,7 @@ impl Postprocessor {
     /// Apply Non-Maximum Merging to a list of detections.
     ///
     /// Merges all overlapping boxes into a single box with averaged confidence.
-    pub fn nmm(&self, detections: &mut Vec<Detection>) -> Vec<Detection> {
+    pub fn nmm(&self, detections: &mut [Detection]) -> Vec<Detection> {
         if detections.is_empty() {
             return Vec::new();
         }
@@ -277,7 +277,7 @@ impl Postprocessor {
     ///
     /// Similar to NMM but merges greedily (each box is merged into at most one group).
     /// This is the default algorithm used in the original SAHI.
-    pub fn greedy_nmm(&self, detections: &mut Vec<Detection>) -> Vec<Detection> {
+    pub fn greedy_nmm(&self, detections: &mut [Detection]) -> Vec<Detection> {
         if detections.is_empty() {
             return Vec::new();
         }

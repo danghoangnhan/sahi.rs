@@ -432,8 +432,6 @@ mod python {
     }
 }
 
-#[cfg(feature = "python")]
-pub use python::PyObjectAnnotation;
 
 // ============================================================================
 // Tests

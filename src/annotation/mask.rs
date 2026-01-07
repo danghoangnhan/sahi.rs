@@ -31,7 +31,7 @@ pub enum MaskFormat {
 ///
 /// RLE is an efficient way to store binary masks by encoding runs of
 /// consecutive pixels with the same value.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct RleData {
     /// Run lengths (alternating background/foreground).
     pub counts: Vec<u32>,
@@ -55,8 +55,8 @@ impl RleData {
         for &count in &self.counts {
             let count = count as usize;
             if val {
-                for i in pos..(pos + count).min(total) {
-                    mask[i] = true;
+                for item in mask.iter_mut().take((pos + count).min(total)).skip(pos) {
+                    *item = true;
                 }
             }
             pos += count;
@@ -92,14 +92,6 @@ impl RleData {
     }
 }
 
-impl Default for RleData {
-    fn default() -> Self {
-        Self {
-            counts: Vec::new(),
-            size: [0, 0],
-        }
-    }
-}
 
 // ============================================================================
 // Polygon

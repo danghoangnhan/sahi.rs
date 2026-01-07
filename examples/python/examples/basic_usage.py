@@ -6,6 +6,7 @@ with your own object detection model.
 """
 
 import numpy as np
+
 from sahi import BoundingBox, Detection, MatchMetric, PostprocessType, Sahi
 
 
@@ -96,7 +97,7 @@ def demo_postprocess_types():
 
     image = np.zeros((640, 640, 3), dtype=np.uint8)
 
-    def detector_with_overlaps(img):
+    def detector_with_overlaps(_img):
         """Return overlapping detections to show postprocessing differences."""
         return [
             Detection(BoundingBox(100, 100, 200, 200), 0, 0.9, "obj"),

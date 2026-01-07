@@ -82,7 +82,7 @@ def test_predict_with_callback(sample_image):
     """Test prediction with a callback function."""
     from sahi_rs import BoundingBox, Detection, Sahi
 
-    def mock_detector(image):
+    def mock_detector(_image):
         # Return a single detection for testing
         return [
             Detection(
@@ -101,7 +101,7 @@ def test_predict_empty_results(sample_image):
     """Test prediction with callback returning no detections."""
     from sahi_rs import Sahi
 
-    def empty_detector(image):
+    def empty_detector(_image):
         return []
 
     sahi = Sahi(slice_width=320, slice_height=320)
@@ -123,7 +123,7 @@ def test_image_data_types(sample_image):
     """Test that various numpy dtypes work as image input."""
     from sahi_rs import Sahi
 
-    def dummy_detector(image):
+    def dummy_detector(_image):
         return []
 
     sahi = Sahi(slice_width=320, slice_height=320)

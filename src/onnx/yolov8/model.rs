@@ -252,7 +252,7 @@ impl DetectionModel for YOLOv8Detector {
 
         // Extract tensor data - try_extract_tensor returns (Shape, &[T])
         let (output_shape, output_data) = output_value.try_extract_tensor::<f32>()?;
-        let output_shape_i64: Vec<i64> = output_shape.iter().map(|&d| d as i64).collect();
+        let output_shape_i64: Vec<i64> = output_shape.iter().copied().collect();
 
         // Process output
         self.processor

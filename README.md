@@ -190,10 +190,6 @@ maturin develop --features python,models-cuda
 # Run Python tests
 pytest tests/python/ -v
 
-# Run linting
-ruff check python/
-ruff format --check python/
-
 # Auto-fix linting issues
 ruff check python/ --fix
 ruff format python/

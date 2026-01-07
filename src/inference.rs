@@ -54,7 +54,7 @@ impl ImageData {
                 let expected_len = (w * self.channels) as usize;
                 let actual_len = actual_end - start;
                 if actual_len < expected_len {
-                    slice_data.extend(std::iter::repeat(0).take(expected_len - actual_len));
+                    slice_data.extend(std::iter::repeat_n(0, expected_len - actual_len));
                 }
             }
         }

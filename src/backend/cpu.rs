@@ -7,17 +7,12 @@ use crate::inference::{ImageData, InferenceCallback};
 use crate::slicer::Slice;
 
 /// CPU backend configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CpuBackendConfig {
     /// Number of threads for parallel processing (0 = auto)
     pub num_threads: usize,
 }
 
-impl Default for CpuBackendConfig {
-    fn default() -> Self {
-        Self { num_threads: 0 }
-    }
-}
 
 /// CPU backend for slice processing.
 #[derive(Debug)]
