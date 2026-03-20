@@ -10,7 +10,7 @@ license = "MIT"
 thiserror = "2.0"
 
 # Optional GPU acceleration (for direct CUDA kernels)
-cudarc = { version = "0.12", optional = true }
+cudarc = { version = "0.12", optional = true, features = ["cuda-12060"] }
 
 # Optional Python bindings
 pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
