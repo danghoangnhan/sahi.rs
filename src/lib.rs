@@ -52,8 +52,8 @@ pub mod slicer;
 pub mod onnx;
 
 #[cfg(feature = "cuda")]
-pub use backend::CudaBackend;
-pub use backend::{Backend, BoxedBackend, CpuBackend};
+pub use backend::{CudaBackend, CudaBackendConfig};
+pub use backend::{Backend, BoxedBackend, CpuBackend, CpuBackendConfig};
 
 // ONNX exports
 #[cfg(feature = "onnx")]
@@ -165,6 +165,10 @@ pub struct SahiBuilder {
     postprocess_config: PostprocessConfig,
     backend: Option<BoxedBackend>,
     include_full_image: bool,
+    /// Number of CPU threads (0 = auto). Only effective with `parallel` feature.
+    num_threads: usize,
+    /// Enable parallel inference calls (not safe with Python/GIL callbacks).
+    parallel_inference: bool,
 }
 
 impl SahiBuilder {
@@ -175,6 +179,8 @@ impl SahiBuilder {
             postprocess_config: PostprocessConfig::default(),
             backend: None,
             include_full_image: false,
+            num_threads: 0,
+            parallel_inference: false,
         }
     }
 
@@ -238,15 +244,37 @@ impl SahiBuilder {
         self
     }
 
+    /// Set the number of CPU threads for parallel slice extraction.
+    ///
+    /// Only effective when the `parallel` feature is enabled.
+    /// A value of 0 (default) uses all available cores.
+    pub fn num_threads(mut self, n: usize) -> Self {
+        self.num_threads = n;
+        self
+    }
+
+    /// Enable parallel inference calls across slices.
+    ///
+    /// **Warning:** Not safe with Python/GIL-bound callbacks.
+    /// Only enable for pure-Rust callbacks. Requires the `parallel` feature.
+    pub fn parallel_inference(mut self, enabled: bool) -> Self {
+        self.parallel_inference = enabled;
+        self
+    }
+
     /// Use a specific backend.
     pub fn backend(mut self, backend: BoxedBackend) -> Self {
         self.backend = Some(backend);
         self
     }
 
-    /// Force CPU backend.
+    /// Force CPU backend with the builder's parallelism settings.
     pub fn cpu(mut self) -> Self {
-        self.backend = Some(Box::new(CpuBackend::new()));
+        let config = CpuBackendConfig {
+            num_threads: self.num_threads,
+            parallel_inference: self.parallel_inference,
+        };
+        self.backend = Some(Box::new(CpuBackend::with_config(config)));
         self
     }
 
@@ -259,10 +287,26 @@ impl SahiBuilder {
 
     /// Build the SAHI instance.
     pub fn build(self) -> Sahi {
+        let backend = self.backend.unwrap_or_else(|| {
+            // Apply parallelism settings to the default CPU backend
+            let config = CpuBackendConfig {
+                num_threads: self.num_threads,
+                parallel_inference: self.parallel_inference,
+            };
+            #[cfg(feature = "cuda")]
+            {
+                let cuda = CudaBackend::new();
+                if cuda.is_available() {
+                    return Box::new(cuda);
+                }
+            }
+            Box::new(CpuBackend::with_config(config))
+        });
+
         Sahi {
             slicer: Slicer::new(self.slicer_config),
             postprocessor: Postprocessor::new(self.postprocess_config),
-            backend: self.backend.unwrap_or_else(backend::default_backend),
+            backend,
             include_full_image: self.include_full_image,
         }
     }

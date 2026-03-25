@@ -1,7 +1,7 @@
 //! CUDA backend for GPU-accelerated slice processing.
 
 use cudarc::driver::result::DriverError;
-use cudarc::driver::{CudaDevice, CudaSlice, DeviceRepr, LaunchAsync, LaunchConfig};
+use cudarc::driver::{CudaDevice, CudaSlice, CudaStream, DeviceRepr, LaunchAsync, LaunchConfig};
 use std::sync::Arc;
 
 use crate::backend::Backend;
@@ -19,6 +19,11 @@ pub struct CudaBackendConfig {
     pub num_streams: usize,
     /// Maximum batch size for inference
     pub max_batch_size: usize,
+    /// Enable extract/infer pipelining across chunks.
+    ///
+    /// When true, GPU extraction of chunk N+1 overlaps with
+    /// CPU inference of chunk N.
+    pub pipeline: bool,
 }
 
 impl Default for CudaBackendConfig {
@@ -27,11 +32,15 @@ impl Default for CudaBackendConfig {
             device_id: 0,
             num_streams: 2,
             max_batch_size: 8,
+            pipeline: true,
         }
     }
 }
 
 /// CUDA backend for GPU-accelerated slice processing.
+///
+/// Supports concurrent slice extraction via multiple CUDA streams
+/// and pipelined extract/infer execution across batches.
 pub struct CudaBackend {
     config: CudaBackendConfig,
     device: Option<Arc<CudaDevice>>,
@@ -85,6 +94,11 @@ impl CudaBackend {
         self.kernel_loaded
     }
 
+    /// Get the current configuration.
+    pub fn config(&self) -> &CudaBackendConfig {
+        &self.config
+    }
+
     /// Upload image data to GPU.
     pub fn upload_image(&self, image: &ImageData) -> Result<CudaSlice<u8>> {
         let device = self
@@ -109,7 +123,40 @@ impl CudaBackend {
             .map_err(|e| Error::gpu(format!("Failed to download data: {}", e)))
     }
 
-    /// Extract a slice from a source image on GPU using the CUDA kernel.
+    /// Create CUDA streams for concurrent execution.
+    fn create_streams(&self) -> Result<Vec<CudaStream>> {
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| Error::gpu("CUDA not initialized"))?;
+
+        let num = self.config.num_streams.max(1);
+        let mut streams = Vec::with_capacity(num);
+        for _ in 0..num {
+            let stream = device
+                .fork_default_stream()
+                .map_err(|e| Error::gpu(format!("Failed to create CUDA stream: {}", e)))?;
+            streams.push(stream);
+        }
+        Ok(streams)
+    }
+
+    /// Wait for all streams to complete and sync back to the default stream.
+    fn sync_streams(&self, streams: &[CudaStream]) -> Result<()> {
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| Error::gpu("CUDA not initialized"))?;
+
+        for stream in streams {
+            device
+                .wait_for(stream)
+                .map_err(|e| Error::gpu(format!("Stream sync failed: {}", e)))?;
+        }
+        Ok(())
+    }
+
+    /// Extract a slice from a source image on GPU using the default stream.
     fn extract_slice_gpu(
         &self,
         src: &CudaSlice<u8>,
@@ -129,12 +176,10 @@ impl CudaBackend {
 
         let output_size = (slice.width * slice.height * channels) as usize;
 
-        // Allocate zeroed output buffer on GPU
         let dst: CudaSlice<u8> = device
             .alloc_zeros(output_size)
             .map_err(|e| Error::gpu(format!("Failed to allocate GPU output: {}", e)))?;
 
-        // Configure launch: one thread per pixel, 16x16 thread blocks
         let block_dim = (16u32, 16u32, 1u32);
         let grid_dim = (
             slice.width.div_ceil(block_dim.0),
@@ -147,12 +192,10 @@ impl CudaBackend {
             shared_mem_bytes: 0,
         };
 
-        // Get the loaded kernel function
         let func = device
             .get_func("sahi_kernels", "extract_slice_kernel")
             .ok_or_else(|| Error::gpu("Kernel function not found"))?;
 
-        // Launch kernel: (src, dst, src_width, slice_x, slice_y, slice_width, slice_height, channels)
         unsafe {
             func.launch(
                 launch_config,
@@ -171,6 +214,238 @@ impl CudaBackend {
         .map_err(|e| Error::gpu(format!("Kernel launch failed: {}", e)))?;
 
         Ok(dst)
+    }
+
+    /// Extract a slice on a specific CUDA stream for concurrent execution.
+    ///
+    /// # Safety
+    /// The caller must ensure that `dst` is not accessed until the stream
+    /// is synchronized.
+    fn extract_slice_on_stream(
+        &self,
+        src: &CudaSlice<u8>,
+        src_width: u32,
+        channels: u32,
+        slice: &Slice,
+        stream: &CudaStream,
+    ) -> Result<CudaSlice<u8>> {
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| Error::gpu("CUDA not initialized"))?;
+
+        if !self.kernel_loaded {
+            return Err(Error::gpu("Slice extraction kernel not loaded"));
+        }
+
+        let output_size = (slice.width * slice.height * channels) as usize;
+
+        let dst: CudaSlice<u8> = device
+            .alloc_zeros(output_size)
+            .map_err(|e| Error::gpu(format!("Failed to allocate GPU output: {}", e)))?;
+
+        let block_dim = (16u32, 16u32, 1u32);
+        let grid_dim = (
+            slice.width.div_ceil(block_dim.0),
+            slice.height.div_ceil(block_dim.1),
+            1u32,
+        );
+        let launch_config = LaunchConfig {
+            block_dim,
+            grid_dim,
+            shared_mem_bytes: 0,
+        };
+
+        let func = device
+            .get_func("sahi_kernels", "extract_slice_kernel")
+            .ok_or_else(|| Error::gpu("Kernel function not found"))?;
+
+        unsafe {
+            func.launch_on_stream(
+                stream,
+                launch_config,
+                (
+                    src,
+                    &dst,
+                    src_width,
+                    slice.x,
+                    slice.y,
+                    slice.width,
+                    slice.height,
+                    channels,
+                ),
+            )
+        }
+        .map_err(|e| Error::gpu(format!("Kernel launch on stream failed: {}", e)))?;
+
+        Ok(dst)
+    }
+
+    /// Extract a chunk of slices on GPU, distributing across streams.
+    /// Returns GPU slice buffers (caller must sync streams before downloading).
+    fn extract_chunk_on_streams(
+        &self,
+        gpu_image: &CudaSlice<u8>,
+        image: &ImageData,
+        chunk: &[Slice],
+        streams: &[CudaStream],
+    ) -> Result<Vec<CudaSlice<u8>>> {
+        let mut gpu_slices = Vec::with_capacity(chunk.len());
+        for (i, s) in chunk.iter().enumerate() {
+            let stream = &streams[i % streams.len()];
+            let gpu_slice = self.extract_slice_on_stream(
+                gpu_image,
+                image.width,
+                image.channels,
+                s,
+                stream,
+            )?;
+            gpu_slices.push(gpu_slice);
+        }
+        Ok(gpu_slices)
+    }
+
+    /// Download extracted GPU slices into ImageData.
+    fn download_chunk(
+        &self,
+        gpu_slices: &[CudaSlice<u8>],
+        chunk: &[Slice],
+        channels: u32,
+    ) -> Result<Vec<ImageData>> {
+        chunk
+            .iter()
+            .zip(gpu_slices.iter())
+            .map(|(s, gpu_slice)| {
+                let data = self.download(gpu_slice)?;
+                Ok(ImageData::new(data, s.width, s.height, channels))
+            })
+            .collect()
+    }
+
+    /// GPU path: stream-concurrent extraction with optional pipelining.
+    fn process_gpu_path(
+        &self,
+        image: &ImageData,
+        slices: &[Slice],
+        callback: &dyn InferenceCallback,
+        gpu_image: &CudaSlice<u8>,
+    ) -> Result<Vec<(Slice, Vec<Detection>)>> {
+        let mut results = Vec::with_capacity(slices.len());
+        let streams = self.create_streams()?;
+        let chunks: Vec<&[Slice]> = slices.chunks(self.config.max_batch_size).collect();
+
+        if self.config.pipeline && chunks.len() > 1 {
+            // Pipelined: overlap GPU extraction of chunk N+1 with inference of chunk N
+            self.process_pipelined(&mut results, image, &chunks, callback, gpu_image, &streams)?;
+        } else {
+            // Non-pipelined: extract then infer per chunk
+            self.process_chunked(&mut results, image, &chunks, callback, gpu_image, &streams)?;
+        }
+
+        Ok(results)
+    }
+
+    /// Non-pipelined chunked processing with stream concurrency.
+    fn process_chunked(
+        &self,
+        results: &mut Vec<(Slice, Vec<Detection>)>,
+        image: &ImageData,
+        chunks: &[&[Slice]],
+        callback: &dyn InferenceCallback,
+        gpu_image: &CudaSlice<u8>,
+        streams: &[CudaStream],
+    ) -> Result<()> {
+        for chunk in chunks {
+            // Launch all extractions across streams
+            let gpu_slices = self.extract_chunk_on_streams(gpu_image, image, chunk, streams)?;
+
+            // Sync all streams before downloading
+            self.sync_streams(streams)?;
+
+            // Download and infer
+            let slice_images = self.download_chunk(&gpu_slices, chunk, image.channels)?;
+            let detections = callback.infer_batch(&slice_images)?;
+
+            for (slice, dets) in chunk.iter().copied().zip(detections) {
+                results.push((slice, dets));
+            }
+        }
+        Ok(())
+    }
+
+    /// Pipelined processing: overlap GPU extraction of chunk N+1 with CPU inference of chunk N.
+    fn process_pipelined(
+        &self,
+        results: &mut Vec<(Slice, Vec<Detection>)>,
+        image: &ImageData,
+        chunks: &[&[Slice]],
+        callback: &dyn InferenceCallback,
+        gpu_image: &CudaSlice<u8>,
+        streams: &[CudaStream],
+    ) -> Result<()> {
+        // Extract first chunk
+        let mut current_gpu_slices =
+            self.extract_chunk_on_streams(gpu_image, image, chunks[0], streams)?;
+        self.sync_streams(streams)?;
+        let mut current_images = self.download_chunk(&current_gpu_slices, chunks[0], image.channels)?;
+
+        for i in 0..chunks.len() {
+            // Start extracting next chunk asynchronously (if there is one)
+            let next_gpu_slices = if i + 1 < chunks.len() {
+                Some(self.extract_chunk_on_streams(
+                    gpu_image,
+                    image,
+                    chunks[i + 1],
+                    streams,
+                )?)
+            } else {
+                None
+            };
+
+            // Infer current chunk (CPU-bound, runs while GPU extracts next chunk)
+            let detections = callback.infer_batch(&current_images)?;
+            for (slice, dets) in chunks[i].iter().copied().zip(detections) {
+                results.push((slice, dets));
+            }
+
+            // Sync and download next chunk if needed
+            if let Some(next_slices) = next_gpu_slices {
+                self.sync_streams(streams)?;
+                current_images =
+                    self.download_chunk(&next_slices, chunks[i + 1], image.channels)?;
+                current_gpu_slices = next_slices;
+            }
+        }
+
+        // Suppress unused variable warning for the last iteration
+        let _ = current_gpu_slices;
+
+        Ok(())
+    }
+
+    /// CPU fallback path: extract slices on CPU, batch by max_batch_size.
+    fn process_cpu_fallback(
+        &self,
+        image: &ImageData,
+        slices: &[Slice],
+        callback: &dyn InferenceCallback,
+    ) -> Result<Vec<(Slice, Vec<Detection>)>> {
+        let mut results = Vec::with_capacity(slices.len());
+
+        for chunk in slices.chunks(self.config.max_batch_size) {
+            let slice_images: Vec<ImageData> = chunk
+                .iter()
+                .map(|s| image.extract_slice(s.x, s.y, s.width, s.height))
+                .collect();
+
+            let detections = callback.infer_batch(&slice_images)?;
+
+            for (slice, dets) in chunk.iter().copied().zip(detections) {
+                results.push((slice, dets));
+            }
+        }
+
+        Ok(results)
     }
 }
 
@@ -201,51 +476,12 @@ impl Backend for CudaBackend {
             return Err(Error::gpu("CUDA device not available"));
         }
 
-        let mut results = Vec::with_capacity(slices.len());
-
         if self.kernel_loaded {
-            // GPU path: upload image once, extract slices on GPU
             let gpu_image = self.upload_image(image)?;
-
-            for chunk in slices.chunks(self.config.max_batch_size) {
-                let slice_images: Vec<ImageData> = chunk
-                    .iter()
-                    .map(|s| {
-                        let gpu_slice = self.extract_slice_gpu(
-                            &gpu_image,
-                            image.width,
-                            image.height,
-                            image.channels,
-                            s,
-                        )?;
-                        let data = self.download(&gpu_slice)?;
-                        Ok(ImageData::new(data, s.width, s.height, image.channels))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-
-                let detections = callback.infer_batch(&slice_images)?;
-
-                for (slice, dets) in chunk.iter().copied().zip(detections) {
-                    results.push((slice, dets));
-                }
-            }
+            self.process_gpu_path(image, slices, callback, &gpu_image)
         } else {
-            // CPU fallback: kernel not loaded, extract slices on CPU
-            for chunk in slices.chunks(self.config.max_batch_size) {
-                let slice_images: Vec<ImageData> = chunk
-                    .iter()
-                    .map(|s| image.extract_slice(s.x, s.y, s.width, s.height))
-                    .collect();
-
-                let detections = callback.infer_batch(&slice_images)?;
-
-                for (slice, dets) in chunk.iter().copied().zip(detections) {
-                    results.push((slice, dets));
-                }
-            }
+            self.process_cpu_fallback(image, slices, callback)
         }
-
-        Ok(results)
     }
 
     fn name(&self) -> &'static str {
@@ -376,6 +612,29 @@ mod tests {
     }
 
     #[test]
+    fn test_config_defaults() {
+        let config = CudaBackendConfig::default();
+        assert_eq!(config.device_id, 0);
+        assert_eq!(config.num_streams, 2);
+        assert_eq!(config.max_batch_size, 8);
+        assert!(config.pipeline);
+    }
+
+    #[test]
+    fn test_custom_config() {
+        let config = CudaBackendConfig {
+            device_id: 0,
+            num_streams: 4,
+            max_batch_size: 16,
+            pipeline: false,
+        };
+        let backend = CudaBackend::with_config(config);
+        assert_eq!(backend.config().num_streams, 4);
+        assert_eq!(backend.config().max_batch_size, 16);
+        assert!(!backend.config().pipeline);
+    }
+
+    #[test]
     fn test_ptx_source_validity() {
         assert!(kernels::SLICE_EXTRACT_PTX.contains("extract_slice_kernel"));
         assert!(kernels::SLICE_EXTRACT_PTX.contains("channel_loop"));
@@ -406,6 +665,120 @@ mod tests {
         // Compare with CPU extraction
         let cpu_result = image.extract_slice(1, 1, 2, 2);
         assert_eq!(result, cpu_result.data);
+    }
+
+    #[test]
+    fn test_stream_creation() {
+        let backend = CudaBackend::new();
+        if !backend.is_available() {
+            println!("Skipping: CUDA not available");
+            return;
+        }
+
+        let streams = backend.create_streams().unwrap();
+        assert_eq!(streams.len(), backend.config().num_streams);
+    }
+
+    #[test]
+    fn test_multi_stream_matches_single_stream() {
+        let single_config = CudaBackendConfig {
+            num_streams: 1,
+            pipeline: false,
+            ..Default::default()
+        };
+        let multi_config = CudaBackendConfig {
+            num_streams: 4,
+            pipeline: false,
+            ..Default::default()
+        };
+
+        let single_backend = CudaBackend::with_config(single_config);
+        let multi_backend = CudaBackend::with_config(multi_config);
+
+        if !single_backend.is_available() || !single_backend.kernel_loaded() {
+            println!("Skipping GPU test: CUDA not available or kernel not loaded");
+            return;
+        }
+
+        let image = ImageData::from_rgb((0..300).map(|i| (i % 256) as u8).collect(), 10, 10);
+        let slices = vec![
+            Slice::new(0, 0, 5, 5, 0),
+            Slice::new(3, 3, 5, 5, 1),
+            Slice::new(5, 5, 5, 5, 2),
+        ];
+
+        let cb = callback(|img: &ImageData| {
+            let sum: u32 = img.data.iter().map(|&b| b as u32).sum();
+            Ok(vec![Detection::new(
+                BoundingBox::new(0.0, 0.0, 1.0, 1.0),
+                0,
+                sum as f32,
+                None,
+            )])
+        });
+
+        let single_result = single_backend
+            .process_slices(&image, &slices, &cb)
+            .unwrap();
+        let multi_result = multi_backend
+            .process_slices(&image, &slices, &cb)
+            .unwrap();
+
+        assert_eq!(single_result.len(), multi_result.len());
+        for (s, m) in single_result.iter().zip(multi_result.iter()) {
+            assert_eq!(s.0, m.0);
+            assert_eq!(s.1.len(), m.1.len());
+            assert_eq!(s.1[0].confidence, m.1[0].confidence);
+        }
+    }
+
+    #[test]
+    fn test_pipeline_matches_non_pipeline() {
+        let no_pipe_config = CudaBackendConfig {
+            max_batch_size: 2, // Force multiple chunks
+            pipeline: false,
+            ..Default::default()
+        };
+        let pipe_config = CudaBackendConfig {
+            max_batch_size: 2,
+            pipeline: true,
+            ..Default::default()
+        };
+
+        let no_pipe = CudaBackend::with_config(no_pipe_config);
+        let piped = CudaBackend::with_config(pipe_config);
+
+        if !no_pipe.is_available() || !no_pipe.kernel_loaded() {
+            println!("Skipping GPU test: CUDA not available or kernel not loaded");
+            return;
+        }
+
+        let image = ImageData::from_rgb((0..300).map(|i| (i % 256) as u8).collect(), 10, 10);
+        let slices = vec![
+            Slice::new(0, 0, 5, 5, 0),
+            Slice::new(3, 3, 5, 5, 1),
+            Slice::new(5, 5, 5, 5, 2),
+            Slice::new(0, 5, 5, 5, 3),
+        ];
+
+        let cb = callback(|img: &ImageData| {
+            let sum: u32 = img.data.iter().map(|&b| b as u32).sum();
+            Ok(vec![Detection::new(
+                BoundingBox::new(0.0, 0.0, 1.0, 1.0),
+                0,
+                sum as f32,
+                None,
+            )])
+        });
+
+        let no_pipe_result = no_pipe.process_slices(&image, &slices, &cb).unwrap();
+        let piped_result = piped.process_slices(&image, &slices, &cb).unwrap();
+
+        assert_eq!(no_pipe_result.len(), piped_result.len());
+        for (np, p) in no_pipe_result.iter().zip(piped_result.iter()) {
+            assert_eq!(np.0, p.0);
+            assert_eq!(np.1[0].confidence, p.1[0].confidence);
+        }
     }
 
     #[test]
