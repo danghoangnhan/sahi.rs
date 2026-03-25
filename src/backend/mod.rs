@@ -5,10 +5,10 @@ mod cpu;
 #[cfg(feature = "cuda")]
 mod cuda;
 
-pub use cpu::CpuBackend;
+pub use cpu::{CpuBackend, CpuBackendConfig};
 
 #[cfg(feature = "cuda")]
-pub use cuda::CudaBackend;
+pub use cuda::{CudaBackend, CudaBackendConfig};
 
 use crate::detection::Detection;
 use crate::error::Result;

@@ -6,36 +6,83 @@ use crate::error::Result;
 use crate::inference::{ImageData, InferenceCallback};
 use crate::slicer::Slice;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 /// CPU backend configuration.
 #[derive(Debug, Clone, Default)]
 pub struct CpuBackendConfig {
-    /// Number of threads for parallel processing (0 = auto)
+    /// Number of threads for parallel processing (0 = auto).
+    /// Only used when the `parallel` feature is enabled.
     pub num_threads: usize,
+    /// Enable parallel inference calls across slices.
+    ///
+    /// **Warning:** Not safe with Python/GIL-bound callbacks, as they will
+    /// contend for the GIL and may serialize with extra overhead.
+    /// Only enable this for pure-Rust callbacks.
+    pub parallel_inference: bool,
 }
 
+
 /// CPU backend for slice processing.
+///
+/// When the `parallel` feature is enabled, slice extraction is parallelized
+/// using rayon. Inference parallelism is opt-in via `parallel_inference`.
 #[derive(Debug)]
 pub struct CpuBackend {
     config: CpuBackendConfig,
+    #[cfg(feature = "parallel")]
+    thread_pool: rayon::ThreadPool,
 }
 
 impl CpuBackend {
     /// Create a new CPU backend with default configuration.
     pub fn new() -> Self {
+        let config = CpuBackendConfig::default();
         Self {
-            config: CpuBackendConfig::default(),
+            #[cfg(feature = "parallel")]
+            thread_pool: Self::build_thread_pool(config.num_threads),
+            config,
         }
     }
 
     /// Create a CPU backend with custom configuration.
     pub fn with_config(config: CpuBackendConfig) -> Self {
-        Self { config }
+        Self {
+            #[cfg(feature = "parallel")]
+            thread_pool: Self::build_thread_pool(config.num_threads),
+            config,
+        }
     }
 
     /// Set the number of threads.
     pub fn with_threads(mut self, num_threads: usize) -> Self {
         self.config.num_threads = num_threads;
+        #[cfg(feature = "parallel")]
+        {
+            self.thread_pool = Self::build_thread_pool(num_threads);
+        }
         self
+    }
+
+    /// Enable or disable parallel inference.
+    pub fn with_parallel_inference(mut self, enabled: bool) -> Self {
+        self.config.parallel_inference = enabled;
+        self
+    }
+
+    /// Get the current configuration.
+    pub fn config(&self) -> &CpuBackendConfig {
+        &self.config
+    }
+
+    #[cfg(feature = "parallel")]
+    fn build_thread_pool(num_threads: usize) -> rayon::ThreadPool {
+        let mut builder = rayon::ThreadPoolBuilder::new();
+        if num_threads > 0 {
+            builder = builder.num_threads(num_threads);
+        }
+        builder.build().expect("Failed to build rayon thread pool")
     }
 }
 
@@ -52,17 +99,15 @@ impl Backend for CpuBackend {
         slices: &[Slice],
         callback: &dyn InferenceCallback,
     ) -> Result<Vec<(Slice, Vec<Detection>)>> {
-        // Extract slice images
-        let slice_images: Vec<ImageData> = slices
-            .iter()
-            .map(|s| image.extract_slice(s.x, s.y, s.width, s.height))
-            .collect();
+        #[cfg(feature = "parallel")]
+        {
+            self.process_slices_parallel(image, slices, callback)
+        }
 
-        // Try batch inference first
-        let detections = callback.infer_batch(&slice_images)?;
-
-        // Pair slices with their detections
-        Ok(slices.iter().copied().zip(detections).collect())
+        #[cfg(not(feature = "parallel"))]
+        {
+            self.process_slices_sequential(image, slices, callback)
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -71,6 +116,61 @@ impl Backend for CpuBackend {
 
     fn is_available(&self) -> bool {
         true
+    }
+}
+
+impl CpuBackend {
+    /// Sequential processing (no rayon).
+    #[cfg_attr(feature = "parallel", allow(dead_code))]
+    fn process_slices_sequential(
+        &self,
+        image: &ImageData,
+        slices: &[Slice],
+        callback: &dyn InferenceCallback,
+    ) -> Result<Vec<(Slice, Vec<Detection>)>> {
+        let slice_images: Vec<ImageData> = slices
+            .iter()
+            .map(|s| image.extract_slice(s.x, s.y, s.width, s.height))
+            .collect();
+
+        let detections = callback.infer_batch(&slice_images)?;
+        Ok(slices.iter().copied().zip(detections).collect())
+    }
+
+    /// Parallel processing using rayon thread pool.
+    #[cfg(feature = "parallel")]
+    fn process_slices_parallel(
+        &self,
+        image: &ImageData,
+        slices: &[Slice],
+        callback: &dyn InferenceCallback,
+    ) -> Result<Vec<(Slice, Vec<Detection>)>> {
+        // Parallel slice extraction
+        let slice_images: Vec<ImageData> = self.thread_pool.install(|| {
+            slices
+                .par_iter()
+                .map(|s| image.extract_slice(s.x, s.y, s.width, s.height))
+                .collect()
+        });
+
+        if self.config.parallel_inference {
+            // Parallel inference (opt-in, NOT safe for Python/GIL callbacks)
+            let results: Result<Vec<(Slice, Vec<Detection>)>> = self.thread_pool.install(|| {
+                slices
+                    .par_iter()
+                    .zip(slice_images.par_iter())
+                    .map(|(s, img)| {
+                        let dets = callback.infer(img)?;
+                        Ok((*s, dets))
+                    })
+                    .collect()
+            });
+            results
+        } else {
+            // Sequential inference (safe for all callbacks)
+            let detections = callback.infer_batch(&slice_images)?;
+            Ok(slices.iter().copied().zip(detections).collect())
+        }
     }
 }
 
@@ -105,6 +205,120 @@ mod tests {
 
         let result = backend.process_slices(&image, &slices, &cb).unwrap();
 
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].1.len(), 1);
+        assert_eq!(result[1].1.len(), 1);
+    }
+
+    #[test]
+    fn test_default_config() {
+        let config = CpuBackendConfig::default();
+        assert_eq!(config.num_threads, 0);
+        assert!(!config.parallel_inference);
+    }
+
+    #[test]
+    fn test_with_threads_config() {
+        let backend = CpuBackend::new().with_threads(4);
+        assert_eq!(backend.config().num_threads, 4);
+    }
+
+    #[test]
+    fn test_with_parallel_inference_config() {
+        let backend = CpuBackend::new().with_parallel_inference(true);
+        assert!(backend.config().parallel_inference);
+    }
+
+    #[test]
+    fn test_sequential_matches_results() {
+        // Verify sequential path produces correct results
+        let backend = CpuBackend::new();
+        let image = ImageData::from_rgb((0..300).map(|i| (i % 256) as u8).collect(), 10, 10);
+        let slices = vec![
+            Slice::new(0, 0, 5, 5, 0),
+            Slice::new(3, 3, 5, 5, 1),
+            Slice::new(5, 5, 5, 5, 2),
+        ];
+
+        let cb = callback(|img: &ImageData| {
+            // Return detection based on image content for verification
+            let sum: u32 = img.data.iter().map(|&b| b as u32).sum();
+            Ok(vec![Detection::new(
+                BoundingBox::new(0.0, 0.0, 1.0, 1.0),
+                0,
+                sum as f32,
+                None,
+            )])
+        });
+
+        let result = backend
+            .process_slices_sequential(&image, &slices, &cb)
+            .unwrap();
+        assert_eq!(result.len(), 3);
+        // Each slice should produce one detection with a unique confidence based on pixel content
+        assert_ne!(result[0].1[0].confidence, result[1].1[0].confidence);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_parallel_extraction_matches_sequential() {
+        let image = ImageData::from_rgb((0..300).map(|i| (i % 256) as u8).collect(), 10, 10);
+        let slices = vec![
+            Slice::new(0, 0, 5, 5, 0),
+            Slice::new(3, 3, 5, 5, 1),
+            Slice::new(5, 5, 5, 5, 2),
+        ];
+
+        let cb = callback(|img: &ImageData| {
+            let sum: u32 = img.data.iter().map(|&b| b as u32).sum();
+            Ok(vec![Detection::new(
+                BoundingBox::new(0.0, 0.0, 1.0, 1.0),
+                0,
+                sum as f32,
+                None,
+            )])
+        });
+
+        // Sequential backend
+        let seq_backend = CpuBackend::new();
+        let seq_result = seq_backend
+            .process_slices_sequential(&image, &slices, &cb)
+            .unwrap();
+
+        // Parallel backend
+        let par_backend = CpuBackend::new().with_threads(2);
+        let par_result = par_backend
+            .process_slices_parallel(&image, &slices, &cb)
+            .unwrap();
+
+        assert_eq!(seq_result.len(), par_result.len());
+        for (seq, par) in seq_result.iter().zip(par_result.iter()) {
+            assert_eq!(seq.0, par.0); // same slice
+            assert_eq!(seq.1.len(), par.1.len());
+            assert_eq!(seq.1[0].confidence, par.1[0].confidence);
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_parallel_inference_produces_correct_results() {
+        let backend = CpuBackend::new()
+            .with_threads(2)
+            .with_parallel_inference(true);
+
+        let image = ImageData::from_rgb(vec![128; 300], 10, 10);
+        let slices = vec![Slice::new(0, 0, 5, 5, 0), Slice::new(5, 5, 5, 5, 1)];
+
+        let cb = callback(|_img: &ImageData| {
+            Ok(vec![Detection::new(
+                BoundingBox::new(1.0, 1.0, 2.0, 2.0),
+                0,
+                0.9,
+                None,
+            )])
+        });
+
+        let result = backend.process_slices(&image, &slices, &cb).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].1.len(), 1);
         assert_eq!(result[1].1.len(), 1);

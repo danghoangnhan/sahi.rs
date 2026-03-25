@@ -9,6 +9,9 @@ license = "MIT"
 # Core
 thiserror = "2.0"
 
+# Optional CPU parallelism
+rayon = { version = "1.10", optional = true }
+
 # Optional GPU acceleration (for direct CUDA kernels)
 cudarc = { version = "0.12", optional = true, features = ["cuda-12060"] }
 
@@ -25,6 +28,9 @@ image = { version = "0.25", optional = true, default-features = false, features 
 
 [features]
 default = []
+
+# CPU parallelism
+parallel = ["dep:rayon"]
 
 # Existing features
 cuda = ["dep:cudarc"]
@@ -45,6 +51,13 @@ models-tensorrt = ["models", "onnx-tensorrt"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "backend_bench"
+harness = false
 
 [[example]]
 name = "basic"
