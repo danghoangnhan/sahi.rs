@@ -175,25 +175,38 @@ impl Preprocessor {
             self.pad_value,
         );
 
-        // Simple nearest-neighbor resize for now
-        // TODO: Use bilinear interpolation for better quality
+        // Bilinear resize into the (possibly padded) target region.
         let src_view = ArrayView3::from_shape(
             (orig_h as usize, orig_w as usize, image.channels as usize),
             &image.data,
         )
         .map_err(|e| Error::preprocessing(format!("Failed to create array view: {}", e)))?;
 
+        let max_x = orig_w as usize - 1;
+        let max_y = orig_h as usize - 1;
         for y in 0..new_h as usize {
+            let src_yf = y as f32 / scale;
+            let y0 = (src_yf.floor() as usize).min(max_y);
+            let y1 = (y0 + 1).min(max_y);
+            let wy = src_yf - y0 as f32;
+
             for x in 0..new_w as usize {
-                // Map back to source coordinates
-                let src_x = ((x as f32 / scale) as usize).min(orig_w as usize - 1);
-                let src_y = ((y as f32 / scale) as usize).min(orig_h as usize - 1);
+                let src_xf = x as f32 / scale;
+                let x0 = (src_xf.floor() as usize).min(max_x);
+                let x1 = (x0 + 1).min(max_x);
+                let wx = src_xf - x0 as f32;
 
                 let dst_y = y + pad_top as usize;
                 let dst_x = x + pad_left as usize;
 
                 for c in 0..image.channels as usize {
-                    output[[dst_y, dst_x, c]] = src_view[[src_y, src_x, c]];
+                    let v00 = src_view[[y0, x0, c]] as f32;
+                    let v01 = src_view[[y0, x1, c]] as f32;
+                    let v10 = src_view[[y1, x0, c]] as f32;
+                    let v11 = src_view[[y1, x1, c]] as f32;
+                    let top = v00 + (v01 - v00) * wx;
+                    let bottom = v10 + (v11 - v10) * wx;
+                    output[[dst_y, dst_x, c]] = (top + (bottom - top) * wy).round() as u8;
                 }
             }
         }
@@ -389,5 +402,21 @@ mod tests {
             .hwc_to_nchw(&hwc);
         assert_eq!(t2[[0, 1, 0, 1]], 11.0);
         assert_eq!(t2[[0, 2, 1, 0]], 22.0);
+    }
+
+    #[test]
+    fn test_letterbox_bilinear_interpolates() {
+        // 2x2 single-channel image: column 0 = 0, column 1 = 100 (a horizontal step).
+        let image = ImageData::new(vec![0, 100, 0, 100], 2, 2, 1);
+        // Upscale 2x2 -> 4x4 (scale = 2, no padding).
+        let (out, info) = Preprocessor::new(4, 4).letterbox(&image).unwrap();
+
+        assert!((info.scale - 2.0).abs() < 1e-6);
+        // Exact at both impls: dst x=0 -> src col 0 (=0); dst x=2 -> src col 1 (=100).
+        assert_eq!(out[[0, 0, 0]], 0);
+        assert_eq!(out[[0, 2, 0]], 100);
+        // dst x=1 maps to src_x = 0.5 -> bilinear average of 0 and 100 = 50.
+        // (Nearest-neighbor would give 0.)
+        assert_eq!(out[[0, 1, 0]], 50);
     }
 }
