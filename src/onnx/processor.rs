@@ -3,7 +3,7 @@
 //! Provides traits and implementations for preprocessing images before
 //! model inference and postprocessing model outputs.
 
-use ndarray::{Array3, Array4, ArrayView3};
+use ndarray::{Array3, Array4, ArrayView3, Axis};
 
 use crate::error::{Error, Result};
 use crate::inference::ImageData;
@@ -203,24 +203,20 @@ impl Preprocessor {
 
     /// Convert HWC u8 array to NCHW f32 tensor.
     pub fn hwc_to_nchw(&self, image: &Array3<u8>) -> Array4<f32> {
-        let (h, w, c) = image.dim();
-
-        // Permute from HWC to CHW
-        let chw = image.view().permuted_axes([2, 0, 1]);
-
-        // Create 4D array with batch dimension
-        let mut output = Array4::<f32>::zeros((1, c, h, w));
-
-        for c_idx in 0..c {
-            for y in 0..h {
-                for x in 0..w {
-                    let value = chw[[c_idx, y, x]] as f32;
-                    output[[0, c_idx, y, x]] = if self.normalize { value / 255.0 } else { value };
+        let normalize = self.normalize;
+        // HWC -> CHW, convert to f32 (optionally normalized), then add the batch axis.
+        image
+            .view()
+            .permuted_axes([2, 0, 1])
+            .mapv(|v| {
+                let value = v as f32;
+                if normalize {
+                    value / 255.0
+                } else {
+                    value
                 }
-            }
-        }
-
-        output
+            })
+            .insert_axis(Axis(0))
     }
 }
 
@@ -368,5 +364,30 @@ mod tests {
         let iou = compute_iou(0.0, 0.0, 100.0, 100.0, 50.0, 0.0, 100.0, 100.0);
         // Intersection: 50x100 = 5000, Union: 10000 + 10000 - 5000 = 15000
         assert!((iou - 5000.0 / 15000.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_hwc_to_nchw_reorders_and_normalizes() {
+        // 2x2 RGB in HWC: [y][x][c].
+        let data = vec![
+            0u8, 1, 2, 10, 11, 12, // row y=0: (x0), (x1)
+            20, 21, 22, 30, 31, 32, // row y=1: (x0), (x1)
+        ];
+        let hwc = Array3::from_shape_vec((2, 2, 3), data).unwrap();
+
+        // normalize = true: NCHW[0, c, y, x] == HWC[y, x, c] / 255
+        let t = Preprocessor::default().hwc_to_nchw(&hwc);
+        assert_eq!(t.dim(), (1, 3, 2, 2));
+        assert!((t[[0, 0, 0, 0]] - 0.0 / 255.0).abs() < 1e-7); // r @ (0,0)
+        assert!((t[[0, 1, 0, 1]] - 11.0 / 255.0).abs() < 1e-7); // g @ (0,1)
+        assert!((t[[0, 2, 1, 0]] - 22.0 / 255.0).abs() < 1e-7); // b @ (1,0)
+        assert!((t[[0, 0, 1, 1]] - 30.0 / 255.0).abs() < 1e-7); // r @ (1,1)
+
+        // normalize = false: raw values.
+        let t2 = Preprocessor::default()
+            .with_normalize(false)
+            .hwc_to_nchw(&hwc);
+        assert_eq!(t2[[0, 1, 0, 1]], 11.0);
+        assert_eq!(t2[[0, 2, 1, 0]], 22.0);
     }
 }
