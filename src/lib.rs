@@ -51,9 +51,9 @@ pub mod slicer;
 #[cfg(feature = "onnx")]
 pub mod onnx;
 
+pub use backend::{Backend, BoxedBackend, CpuBackend, CpuBackendConfig};
 #[cfg(feature = "cuda")]
 pub use backend::{CudaBackend, CudaBackendConfig};
-pub use backend::{Backend, BoxedBackend, CpuBackend, CpuBackendConfig};
 
 // ONNX exports
 #[cfg(feature = "onnx")]
