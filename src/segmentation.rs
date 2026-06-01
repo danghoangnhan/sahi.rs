@@ -1,0 +1,557 @@
+//! Instance-segmentation pipeline (sub-project 9a of the segmentation epic).
+//!
+//! Adds a mask-carrying path alongside the bbox detection pipeline. A
+//! [`SegmentationCallback`] returns slice-relative [`MaskedDetection`]s; the
+//! [`predict_instances`](crate::Sahi::predict_instances) method slices the image,
+//! runs the callback per slice, rebases results to image coordinates, and stitches
+//! them with NMS (each survivor keeps its own mask).
+//!
+//! Mask-aware merging (NMM/GREEDYNMM mask union) and Python bindings are separate
+//! sub-projects (9b, 9c).
+
+use crate::annotation::Mask;
+use crate::detection::{BoundingBox, Detection};
+use crate::error::Result;
+use crate::inference::ImageData;
+use crate::postprocess::{MatchMetric, PostprocessConfig, PostprocessType};
+
+/// A detection paired with an optional segmentation mask.
+///
+/// Score, class, and bounding box live in `detection` (so NMS has a score to sort
+/// and threshold on); `mask` is `None` for detection-only results.
+#[derive(Debug, Clone)]
+pub struct MaskedDetection {
+    /// The underlying detection (bbox, class, confidence).
+    pub detection: Detection,
+    /// Optional instance mask, in the same coordinate space as `detection.bbox`.
+    pub mask: Option<Mask>,
+}
+
+impl MaskedDetection {
+    /// Create a new masked detection.
+    pub fn new(detection: Detection, mask: Option<Mask>) -> Self {
+        Self { detection, mask }
+    }
+
+    /// Detection confidence (convenience accessor).
+    #[inline]
+    pub fn confidence(&self) -> f32 {
+        self.detection.confidence
+    }
+
+    /// Whether this result carries a mask.
+    #[inline]
+    pub fn has_mask(&self) -> bool {
+        self.mask.is_some()
+    }
+}
+
+/// Trait for segmentation inference callbacks.
+///
+/// Returns detections with masks in coordinates relative to the given image slice.
+pub trait SegmentationCallback: Send + Sync {
+    /// Run segmentation inference on a single image (slice).
+    fn infer(&self, image: &ImageData) -> Result<Vec<MaskedDetection>>;
+
+    /// Run inference on a batch of images. Defaults to calling `infer` per image.
+    fn infer_batch(&self, images: &[ImageData]) -> Result<Vec<Vec<MaskedDetection>>> {
+        images.iter().map(|img| self.infer(img)).collect()
+    }
+}
+
+/// Closure-backed segmentation callback.
+pub struct FnSegCallback<F>
+where
+    F: Fn(&ImageData) -> Result<Vec<MaskedDetection>> + Send + Sync,
+{
+    func: F,
+}
+
+impl<F> FnSegCallback<F>
+where
+    F: Fn(&ImageData) -> Result<Vec<MaskedDetection>> + Send + Sync,
+{
+    /// Create a callback from a function.
+    pub fn new(func: F) -> Self {
+        Self { func }
+    }
+}
+
+impl<F> SegmentationCallback for FnSegCallback<F>
+where
+    F: Fn(&ImageData) -> Result<Vec<MaskedDetection>> + Send + Sync,
+{
+    fn infer(&self, image: &ImageData) -> Result<Vec<MaskedDetection>> {
+        (self.func)(image)
+    }
+}
+
+/// Create a [`SegmentationCallback`] from a closure.
+pub fn seg_callback<F>(f: F) -> FnSegCallback<F>
+where
+    F: Fn(&ImageData) -> Result<Vec<MaskedDetection>> + Send + Sync,
+{
+    FnSegCallback::new(f)
+}
+
+/// Rebase a slice-relative mask into image coordinates: shift every polygon by
+/// `(dx, dy)` and reset `full_shape` to the full image dimensions.
+///
+/// A dedicated rebase is needed because `Mask::get_shifted` clips to the slice's
+/// `full_shape` and cannot move a mask into image space.
+pub fn rebase_mask(mask: &Mask, dx: f32, dy: f32, image_w: u32, image_h: u32) -> Mask {
+    let shifted: Vec<Vec<f32>> = mask
+        .segmentation()
+        .iter()
+        .map(|p| p.shift(dx, dy).points)
+        .collect();
+    Mask::new(shifted, [image_h, image_w], None)
+}
+
+/// Stitch image-space masked detections with NMS, keeping each survivor's mask.
+///
+/// 9a is NMS-only regardless of `config.postprocess_type`; mask-union merging for
+/// NMM/GREEDYNMM is sub-project 9b.
+pub fn seg_stitch(
+    mut items: Vec<MaskedDetection>,
+    config: &PostprocessConfig,
+) -> Vec<MaskedDetection> {
+    // Drop low-confidence detections, then sort by confidence (descending).
+    items.retain(|m| m.detection.confidence >= config.confidence_threshold);
+    items.sort_by(|a, b| {
+        b.detection
+            .confidence
+            .partial_cmp(&a.detection.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    match config.postprocess_type {
+        PostprocessType::NMS => seg_nms(items, config),
+        PostprocessType::NMM => seg_nmm(items, config),
+        PostprocessType::GREEDYNMM => seg_greedy_nmm(items, config),
+    }
+}
+
+/// Bounding-box match score for the configured metric.
+fn match_score(a: &BoundingBox, b: &BoundingBox, metric: MatchMetric) -> f32 {
+    match metric {
+        MatchMetric::IOU => a.iou(b),
+        MatchMetric::IOS => a.ios(b),
+    }
+}
+
+/// NMS: keep the highest-confidence box and suppress overlapping same-class boxes;
+/// survivors keep their own mask. Assumes `items` is already sorted by descending
+/// confidence.
+fn seg_nms(items: Vec<MaskedDetection>, config: &PostprocessConfig) -> Vec<MaskedDetection> {
+    let n = items.len();
+    let mut keep = vec![true; n];
+    for i in 0..n {
+        if !keep[i] {
+            continue;
+        }
+        for j in (i + 1)..n {
+            if !keep[j] {
+                continue;
+            }
+            if config.class_aware && items[i].detection.class_id != items[j].detection.class_id {
+                continue;
+            }
+            let score = match_score(
+                &items[i].detection.bbox,
+                &items[j].detection.bbox,
+                config.match_metric,
+            );
+            if score > config.match_threshold {
+                keep[j] = false;
+            }
+        }
+    }
+    items
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(m, k)| k.then_some(m))
+        .collect()
+}
+
+/// NMM: group each anchor's matches (compared against the anchor) and merge each
+/// group into one detection (unioned bbox, anchor's max confidence, unioned mask).
+fn seg_nmm(items: Vec<MaskedDetection>, config: &PostprocessConfig) -> Vec<MaskedDetection> {
+    let n = items.len();
+    let mut used = vec![false; n];
+    let mut result = Vec::new();
+    for i in 0..n {
+        if used[i] {
+            continue;
+        }
+        let mut group = vec![i];
+        for j in (i + 1)..n {
+            if used[j] {
+                continue;
+            }
+            if config.class_aware && items[i].detection.class_id != items[j].detection.class_id {
+                continue;
+            }
+            let score = match_score(
+                &items[i].detection.bbox,
+                &items[j].detection.bbox,
+                config.match_metric,
+            );
+            if score > config.match_threshold {
+                group.push(j);
+            }
+        }
+        for &k in &group {
+            used[k] = true;
+        }
+        result.push(merge_group(&items, &group));
+    }
+    result
+}
+
+/// GREEDYNMM: like NMM, but the comparison box grows as it absorbs matches.
+fn seg_greedy_nmm(items: Vec<MaskedDetection>, config: &PostprocessConfig) -> Vec<MaskedDetection> {
+    let n = items.len();
+    let mut used = vec![false; n];
+    let mut result = Vec::new();
+    for i in 0..n {
+        if used[i] {
+            continue;
+        }
+        used[i] = true;
+        let mut group = vec![i];
+        let mut bbox = items[i].detection.bbox;
+        for j in (i + 1)..n {
+            if used[j] {
+                continue;
+            }
+            if config.class_aware && items[i].detection.class_id != items[j].detection.class_id {
+                continue;
+            }
+            let score = match_score(&bbox, &items[j].detection.bbox, config.match_metric);
+            if score > config.match_threshold {
+                bbox = bbox.union_box(&items[j].detection.bbox);
+                used[j] = true;
+                group.push(j);
+            }
+        }
+        result.push(merge_group(&items, &group));
+    }
+    result
+}
+
+/// Merge a group of detections (the first is the highest-confidence anchor) into
+/// one: union bbox, the anchor's confidence/class, and the union of present masks.
+fn merge_group(items: &[MaskedDetection], group: &[usize]) -> MaskedDetection {
+    let anchor = &items[group[0]];
+    let mut bbox = anchor.detection.bbox;
+    for &k in &group[1..] {
+        bbox = bbox.union_box(&items[k].detection.bbox);
+    }
+    let mut detection = anchor.detection.clone();
+    detection.bbox = bbox;
+
+    let masks: Vec<Mask> = group
+        .iter()
+        .filter_map(|&k| items[k].mask.clone())
+        .collect();
+    MaskedDetection::new(detection, union_masks(&masks))
+}
+
+/// Union several masks into one by concatenating their polygon sets, keeping the
+/// first mask's `full_shape`. Returns `None` when no masks are given.
+fn union_masks(masks: &[Mask]) -> Option<Mask> {
+    let first = masks.first()?;
+    let shape = first.full_shape();
+    let polygons: Vec<Vec<f32>> = masks
+        .iter()
+        .flat_map(|m| m.to_coco_segmentation())
+        .collect();
+    Some(Mask::new(polygons, shape, None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::annotation::FullShape;
+    use crate::detection::BoundingBox;
+    use crate::postprocess::PostprocessType;
+    use crate::Sahi;
+
+    fn masked_poly(
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        conf: f32,
+        class: u32,
+        poly: Vec<f32>,
+    ) -> MaskedDetection {
+        MaskedDetection::new(
+            Detection::new(BoundingBox::new(x, y, w, h), class, conf, None),
+            Some(Mask::new(vec![poly], [200u32, 200u32], None)),
+        )
+    }
+
+    fn masked_nomask(x: f32, y: f32, w: f32, h: f32, conf: f32, class: u32) -> MaskedDetection {
+        MaskedDetection::new(
+            Detection::new(BoundingBox::new(x, y, w, h), class, conf, None),
+            None,
+        )
+    }
+
+    fn in_mask(m: &Mask, x: usize, y: usize) -> bool {
+        m.to_bool_mask()[y * (m.full_shape().width as usize) + x]
+    }
+
+    fn masked(
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        conf: f32,
+        class: u32,
+        with_mask: bool,
+    ) -> MaskedDetection {
+        let mask = with_mask.then(|| {
+            Mask::new(
+                vec![vec![x, y, x + w, y, x + w, y + h, x, y + h]],
+                [100u32, 100u32],
+                None,
+            )
+        });
+        MaskedDetection::new(
+            Detection::new(BoundingBox::new(x, y, w, h), class, conf, None),
+            mask,
+        )
+    }
+
+    #[test]
+    fn test_rebase_mask_shifts_and_resets_shape() {
+        let m = Mask::new(
+            vec![vec![10.0, 10.0, 20.0, 10.0, 20.0, 20.0, 10.0, 20.0]],
+            [50u32, 50u32],
+            None,
+        );
+        let r = rebase_mask(&m, 100.0, 5.0, 200, 100);
+        let pts = &r.segmentation()[0].points;
+        assert_eq!(pts[0], 110.0);
+        assert_eq!(pts[1], 15.0);
+        assert_eq!(r.full_shape(), FullShape::new(100, 200));
+    }
+
+    #[test]
+    fn test_seg_stitch_nms_keeps_top_and_mask() {
+        let cfg = PostprocessConfig::new(0.5, 0.0).with_postprocess_type(PostprocessType::NMS);
+        let items = vec![
+            masked(0.0, 0.0, 100.0, 100.0, 0.9, 0, true),
+            masked(10.0, 10.0, 100.0, 100.0, 0.8, 0, true), // overlaps the first
+            masked(500.0, 500.0, 20.0, 20.0, 0.7, 0, true), // far away
+        ];
+        let out = seg_stitch(items, &cfg);
+        assert_eq!(out.len(), 2);
+        assert!((out[0].detection.confidence - 0.9).abs() < 1e-6);
+        assert!(out[0].mask.is_some());
+    }
+
+    #[test]
+    fn test_seg_stitch_confidence_filter() {
+        let cfg = PostprocessConfig::new(0.5, 0.5);
+        let items = vec![
+            masked(0.0, 0.0, 10.0, 10.0, 0.6, 0, true),
+            masked(50.0, 50.0, 10.0, 10.0, 0.3, 0, true), // below the conf threshold
+        ];
+        let out = seg_stitch(items, &cfg);
+        assert_eq!(out.len(), 1);
+        assert!((out[0].detection.confidence - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_predict_instances_rebases_to_image_coords() {
+        // 200x100 image, 100x100 slices, no overlap -> two slices at x=0 and x=100.
+        let image = ImageData::from_rgb(vec![0u8; 200 * 100 * 3], 200, 100);
+        let sahi = Sahi::builder()
+            .slice_size(100, 100)
+            .overlap(0.0, 0.0)
+            .build();
+
+        let cb = seg_callback(|_img: &ImageData| {
+            Ok(vec![MaskedDetection::new(
+                Detection::new(BoundingBox::new(10.0, 10.0, 10.0, 10.0), 0, 0.9, None),
+                Some(Mask::new(
+                    vec![vec![10.0, 10.0, 20.0, 10.0, 20.0, 20.0, 10.0, 20.0]],
+                    [100u32, 100u32],
+                    None,
+                )),
+            )])
+        });
+
+        let out = sahi.predict_instances(&image, &cb).unwrap();
+        assert_eq!(out.len(), 2);
+
+        // The second slice (origin x=100) -> detection at x=110, mask shifted, full image shape.
+        let far = out
+            .iter()
+            .find(|m| m.detection.bbox.x > 100.0)
+            .expect("slice-1 detection present");
+        let pts = &far.mask.as_ref().unwrap().segmentation()[0].points;
+        assert_eq!(pts[0], 110.0);
+        assert_eq!(pts[1], 10.0);
+        assert_eq!(
+            far.mask.as_ref().unwrap().full_shape(),
+            FullShape::new(100, 200)
+        );
+    }
+
+    #[test]
+    fn test_predict_instances_detection_only_passthrough() {
+        let image = ImageData::from_rgb(vec![0u8; 100 * 100 * 3], 100, 100);
+        let sahi = Sahi::builder().slice_size(100, 100).build();
+        let cb = seg_callback(|_img: &ImageData| {
+            Ok(vec![MaskedDetection::new(
+                Detection::new(BoundingBox::new(5.0, 5.0, 10.0, 10.0), 0, 0.9, None),
+                None,
+            )])
+        });
+        let out = sahi.predict_instances(&image, &cb).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].mask.is_none());
+    }
+
+    #[test]
+    fn test_union_masks_concatenates_and_preserves_shape() {
+        let m1 = Mask::new(
+            vec![vec![0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0]],
+            [50u32, 50u32],
+            None,
+        );
+        let m2 = Mask::new(
+            vec![vec![20.0, 20.0, 30.0, 20.0, 30.0, 30.0, 20.0, 30.0]],
+            [50u32, 50u32],
+            None,
+        );
+        let u = union_masks(&[m1, m2]).unwrap();
+        assert_eq!(u.segmentation().len(), 2);
+        assert_eq!(u.full_shape(), FullShape::new(50, 50));
+        assert!(union_masks(&[]).is_none());
+    }
+
+    #[test]
+    fn test_nmm_unions_masks() {
+        let cfg = PostprocessConfig::new(0.5, 0.0).with_postprocess_type(PostprocessType::NMM);
+        // A and B overlap (bbox IoU ~0.68 > 0.5); their masks cover disjoint regions.
+        let a = masked_poly(
+            0.0,
+            0.0,
+            100.0,
+            100.0,
+            0.9,
+            0,
+            vec![5.0, 5.0, 35.0, 5.0, 35.0, 35.0, 5.0, 35.0],
+        );
+        let b = masked_poly(
+            10.0,
+            10.0,
+            100.0,
+            100.0,
+            0.8,
+            0,
+            vec![60.0, 60.0, 90.0, 60.0, 90.0, 90.0, 60.0, 90.0],
+        );
+        let out = seg_stitch(vec![a, b], &cfg);
+        assert_eq!(out.len(), 1);
+        let m = &out[0];
+        assert!((m.detection.confidence - 0.9).abs() < 1e-6); // max of the group
+        assert_eq!(m.detection.bbox.width, 110.0); // union of (0..100) and (10..110)
+        let mask = m.mask.as_ref().unwrap();
+        assert!(in_mask(mask, 20, 20)); // A's region
+        assert!(in_mask(mask, 75, 75)); // B's region -> proves the union
+    }
+
+    #[test]
+    fn test_greedy_nmm_chain_merges_to_one() {
+        let cfg =
+            PostprocessConfig::new(0.5, 0.0).with_postprocess_type(PostprocessType::GREEDYNMM);
+        let a = masked_poly(
+            0.0,
+            0.0,
+            100.0,
+            100.0,
+            0.9,
+            0,
+            vec![5.0, 5.0, 15.0, 5.0, 15.0, 15.0, 5.0, 15.0],
+        );
+        let b = masked_poly(
+            20.0,
+            0.0,
+            100.0,
+            100.0,
+            0.8,
+            0,
+            vec![60.0, 5.0, 70.0, 5.0, 70.0, 15.0, 60.0, 15.0],
+        );
+        let c = masked_poly(
+            40.0,
+            0.0,
+            100.0,
+            100.0,
+            0.7,
+            0,
+            vec![125.0, 5.0, 135.0, 5.0, 135.0, 15.0, 125.0, 15.0],
+        );
+        let out = seg_stitch(vec![a, b, c], &cfg);
+        assert_eq!(out.len(), 1);
+        let m = &out[0];
+        assert!((m.detection.confidence - 0.9).abs() < 1e-6);
+        assert_eq!(m.detection.bbox.width, 140.0); // (0..140)
+        let mask = m.mask.as_ref().unwrap();
+        assert!(in_mask(mask, 10, 10)); // A's region
+        assert!(in_mask(mask, 130, 10)); // C's region -> whole chain merged
+    }
+
+    #[test]
+    fn test_merge_uses_present_mask_when_anchor_has_none() {
+        let cfg = PostprocessConfig::new(0.5, 0.0).with_postprocess_type(PostprocessType::NMM);
+        // The higher-confidence anchor has no mask; the lower-conf member carries one.
+        let anchor = masked_nomask(0.0, 0.0, 100.0, 100.0, 0.9, 0);
+        let member = masked_poly(
+            10.0,
+            10.0,
+            100.0,
+            100.0,
+            0.8,
+            0,
+            vec![20.0, 20.0, 40.0, 20.0, 40.0, 40.0, 20.0, 40.0],
+        );
+        let out = seg_stitch(vec![anchor, member], &cfg);
+        assert_eq!(out.len(), 1);
+        let mask = out[0].mask.as_ref().expect("merged mask from the member");
+        assert!(in_mask(mask, 30, 30));
+    }
+
+    #[test]
+    fn test_nmm_keeps_disjoint_detections() {
+        let cfg = PostprocessConfig::new(0.5, 0.0).with_postprocess_type(PostprocessType::NMM);
+        let a = masked_poly(
+            0.0,
+            0.0,
+            20.0,
+            20.0,
+            0.9,
+            0,
+            vec![0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0],
+        );
+        let b = masked_poly(
+            150.0,
+            150.0,
+            20.0,
+            20.0,
+            0.8,
+            0,
+            vec![150.0, 150.0, 160.0, 150.0, 160.0, 160.0, 150.0, 160.0],
+        );
+        let out = seg_stitch(vec![a, b], &cfg);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|m| m.mask.is_some()));
+    }
+}
