@@ -45,6 +45,7 @@ pub mod error;
 pub mod inference;
 pub mod model;
 pub mod postprocess;
+pub mod segmentation;
 pub mod slicer;
 
 // ONNX Runtime support (feature-gated)
@@ -76,6 +77,7 @@ pub use annotation::{
 };
 
 pub use postprocess::{MatchMetric, PostprocessConfig, PostprocessType, Postprocessor};
+pub use segmentation::{seg_callback, MaskedDetection, SegmentationCallback};
 pub use slicer::{Slice, Slicer, SlicerConfig};
 
 /// High-level SAHI interface.
@@ -129,6 +131,44 @@ impl Sahi {
 
         // Postprocess results
         Ok(self.postprocessor.stitch(&slice_detections))
+    }
+
+    /// Run sliced instance-segmentation inference on an image.
+    ///
+    /// Mirrors [`predict`](Self::predict) for masks: slices the image, runs the
+    /// segmentation callback per slice, rebases each detection and mask into image
+    /// coordinates, and stitches with NMS (each survivor keeps its own mask).
+    pub fn predict_instances(
+        &self,
+        image: &ImageData,
+        callback: &dyn SegmentationCallback,
+    ) -> Result<Vec<MaskedDetection>> {
+        let slices = self.slicer.slice(image.width, image.height);
+        let mut all: Vec<MaskedDetection> = Vec::new();
+
+        for slice in &slices {
+            let slice_img = image.extract_slice(slice.x, slice.y, slice.width, slice.height);
+            for mut pred in callback.infer(&slice_img)? {
+                pred.detection = pred.detection.translate(slice.x as f32, slice.y as f32);
+                if let Some(m) = pred.mask.take() {
+                    pred.mask = Some(segmentation::rebase_mask(
+                        &m,
+                        slice.x as f32,
+                        slice.y as f32,
+                        image.width,
+                        image.height,
+                    ));
+                }
+                all.push(pred);
+            }
+        }
+
+        // Optionally include full-image inference (already in image coordinates).
+        if self.include_full_image {
+            all.extend(callback.infer(image)?);
+        }
+
+        Ok(segmentation::seg_stitch(all, self.postprocessor.config()))
     }
 
     /// Get the current slicer configuration.
