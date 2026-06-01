@@ -432,88 +432,148 @@ fn fill_polygon(mask: &mut [bool], width: usize, height: usize, polygon: &Polygo
     }
 }
 
-/// Convert a boolean mask to polygon representation.
+/// Convert a boolean mask to polygon representation via contour tracing.
 ///
-/// This uses a simple contour tracing algorithm.
+/// Traces the outer contour of each connected foreground component with the
+/// Moore-neighbor algorithm (clockwise, "return to start" stopping), producing
+/// one ordered polygon ring per component.
+///
+/// Limitations (see `docs/superpowers/specs/2026-06-01-mask-contour-tracing-design.md`):
+/// outer contours only (holes are filled); vertices are at pixel centers, so a
+/// filled region's polygon is ~1px smaller than its pixel extent; components with
+/// fewer than 3 boundary points (isolated / 2-px specks) are dropped.
 fn bool_mask_to_polygons(mask: &[bool], width: u32, height: u32) -> Vec<Vec<f32>> {
-    // Simple implementation: find connected regions and trace their contours
-    // For production use, consider using a proper contour finding algorithm
-
-    let mut polygons = Vec::new();
-    let mut visited = vec![false; mask.len()];
-
     let width = width as usize;
     let height = height as usize;
+    if width == 0 || height == 0 || mask.len() < width * height {
+        return Vec::new();
+    }
 
-    for start_y in 0..height {
-        for start_x in 0..width {
-            let idx = start_y * width + start_x;
+    let is_fg = |x: i32, y: i32| -> bool {
+        x >= 0
+            && y >= 0
+            && (x as usize) < width
+            && (y as usize) < height
+            && mask[y as usize * width + x as usize]
+    };
 
-            if mask[idx] && !visited[idx] {
-                // Found a new region, trace its contour
-                let x = start_x;
-                let y = start_y;
+    // Generous backstop against a runaway trace (any real contour is far shorter).
+    let cap = 4 * width * height + 8;
+    let mut visited = vec![false; width * height]; // component membership
+    let mut polygons: Vec<Vec<f32>> = Vec::new();
 
-                // Simple boundary following
-                let mut points = Vec::new();
-                let mut queue = vec![(x, y)];
+    for sy in 0..height {
+        for sx in 0..width {
+            if !mask[sy * width + sx] || visited[sy * width + sx] {
+                continue;
+            }
+            // Raster order guarantees this is the component's top-/left-most pixel:
+            // its west neighbor is background, so it sits on the outer boundary and
+            // is a valid Moore start.
+            let contour = trace_contour(&is_fg, sx as i32, sy as i32, cap);
+            mark_component(mask, &mut visited, width, height, sx, sy);
 
-                while let Some((cx, cy)) = queue.pop() {
-                    let idx = cy * width + cx;
-                    if visited[idx] {
-                        continue;
-                    }
-                    visited[idx] = true;
-
-                    // Check if this is a boundary pixel
-                    let is_boundary = cx == 0
-                        || cy == 0
-                        || cx == width - 1
-                        || cy == height - 1
-                        || !mask[cy * width + (cx - 1)]
-                        || !mask[cy * width + (cx + 1)]
-                        || !mask[(cy - 1) * width + cx]
-                        || !mask[(cy + 1) * width + cx];
-
-                    if is_boundary {
-                        points.push((cx as f32, cy as f32));
-                    }
-
-                    // Add neighbors to queue
-                    if cx > 0 && mask[cy * width + (cx - 1)] && !visited[cy * width + (cx - 1)] {
-                        queue.push((cx - 1, cy));
-                    }
-                    if cx < width - 1
-                        && mask[cy * width + (cx + 1)]
-                        && !visited[cy * width + (cx + 1)]
-                    {
-                        queue.push((cx + 1, cy));
-                    }
-                    if cy > 0 && mask[(cy - 1) * width + cx] && !visited[(cy - 1) * width + cx] {
-                        queue.push((cx, cy - 1));
-                    }
-                    if cy < height - 1
-                        && mask[(cy + 1) * width + cx]
-                        && !visited[(cy + 1) * width + cx]
-                    {
-                        queue.push((cx, cy + 1));
-                    }
+            if contour.len() >= 3 {
+                let mut flat = Vec::with_capacity(contour.len() * 2);
+                for (x, y) in contour {
+                    flat.push(x as f32);
+                    flat.push(y as f32);
                 }
-
-                // Convert to flat polygon format
-                if points.len() >= 3 {
-                    let mut polygon = Vec::new();
-                    for (px, py) in points {
-                        polygon.push(px);
-                        polygon.push(py);
-                    }
-                    polygons.push(polygon);
-                }
+                polygons.push(flat);
             }
         }
     }
 
     polygons
+}
+
+/// Moore neighborhood in clockwise order (image coords, y down): E, SE, S, SW, W, NW, N, NE.
+const MOORE_DIRS: [(i32, i32); 8] = [
+    (1, 0),
+    (1, 1),
+    (0, 1),
+    (-1, 1),
+    (-1, 0),
+    (-1, -1),
+    (0, -1),
+    (1, -1),
+];
+
+/// Trace the outer contour of one component clockwise from `start`, which must be
+/// the top-/left-most pixel of the component (so it was entered from the west).
+/// Returns the ordered ring of pixel coordinates (start not repeated at the end).
+fn trace_contour<F: Fn(i32, i32) -> bool>(
+    is_fg: &F,
+    start_x: i32,
+    start_y: i32,
+    cap: usize,
+) -> Vec<(i32, i32)> {
+    let start = (start_x, start_y);
+    let mut contour = vec![start];
+    let mut p = start;
+    // Direction from `p` to the pixel we came from. We arrived at the start from the
+    // west, so the clockwise neighbor search begins just past W.
+    let mut dir_to_prev = 4usize; // index of W in MOORE_DIRS
+
+    for _ in 0..cap {
+        let mut next = None;
+        for k in 1..=8 {
+            let d = (dir_to_prev + k) % 8;
+            let (dx, dy) = MOORE_DIRS[d];
+            if is_fg(p.0 + dx, p.1 + dy) {
+                next = Some((d, (p.0 + dx, p.1 + dy)));
+                break;
+            }
+        }
+        let (d, q) = match next {
+            Some(v) => v,
+            None => break, // isolated pixel: no foreground neighbor
+        };
+        // From `q`, the pixel we came from (`p`) lies in the opposite direction.
+        dir_to_prev = (d + 4) % 8;
+        p = q;
+        if p == start {
+            break; // closed the ring
+        }
+        contour.push(p);
+    }
+
+    contour
+}
+
+/// Flood-fill (8-connectivity) the component containing `(sx, sy)` into `visited`,
+/// so the raster scan does not restart inside an already-traced component.
+fn mark_component(
+    mask: &[bool],
+    visited: &mut [bool],
+    width: usize,
+    height: usize,
+    sx: usize,
+    sy: usize,
+) {
+    let mut stack = vec![(sx, sy)];
+    while let Some((x, y)) = stack.pop() {
+        let i = y * width + x;
+        if visited[i] || !mask[i] {
+            continue;
+        }
+        visited[i] = true;
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let nx = x as i32 + dx;
+                let ny = y as i32 + dy;
+                if nx >= 0 && ny >= 0 && (nx as usize) < width && (ny as usize) < height {
+                    let ni = ny as usize * width + nx as usize;
+                    if mask[ni] && !visited[ni] {
+                        stack.push((nx as usize, ny as usize));
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -617,5 +677,132 @@ mod tests {
 
         let coco = mask.to_coco_segmentation();
         assert_eq!(coco, segmentation);
+    }
+
+    // ---- contour tracing (bool_mask_to_polygons) ----
+
+    /// Build a `grid`x`grid` bool mask with an inclusive filled rectangle.
+    fn filled_rect(grid: usize, x0: usize, y0: usize, x1: usize, y1: usize) -> Vec<bool> {
+        let mut m = vec![false; grid * grid];
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                m[y * grid + x] = true;
+            }
+        }
+        m
+    }
+
+    /// IoU between two equal-length boolean masks.
+    fn mask_iou(a: &[bool], b: &[bool]) -> f32 {
+        let inter = a.iter().zip(b).filter(|(&p, &q)| p && q).count() as f32;
+        let union = a.iter().zip(b).filter(|(&p, &q)| p || q).count() as f32;
+        if union == 0.0 {
+            1.0
+        } else {
+            inter / union
+        }
+    }
+
+    #[test]
+    fn test_bool_mask_polygon_is_ordered_ring() {
+        // 20x20 filled square in a 28x28 grid.
+        let mask = filled_rect(28, 4, 4, 23, 23);
+        let polys = bool_mask_to_polygons(&mask, 28, 28);
+        assert_eq!(polys.len(), 1, "one filled rectangle -> one polygon");
+
+        let pts: Vec<(f32, f32)> = polys[0].chunks_exact(2).map(|c| (c[0], c[1])).collect();
+        assert!(pts.len() >= 4);
+
+        // A traced ring steps one pixel at a time, so consecutive vertices (incl.
+        // the wrap from last to first) are 8-adjacent: distance <= sqrt(2). The
+        // broken impl emits boundary pixels in flood-fill order and jumps around.
+        let max_step = 2.0_f32.sqrt() + 1e-3;
+        for i in 0..pts.len() {
+            let (x1, y1) = pts[i];
+            let (x2, y2) = pts[(i + 1) % pts.len()];
+            let d = ((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt();
+            assert!(d <= max_step, "non-adjacent step at {}: dist {}", i, d);
+        }
+    }
+
+    #[test]
+    fn test_bool_mask_round_trips() {
+        // L-shape: 20x20 square minus its top-right 10x10 quadrant. A correct outer
+        // contour follows the concavity, so re-rasterizing leaves the notch empty; the
+        // broken (flood-fill-order) impl bridges the concavity and floods the notch.
+        let grid = 28usize;
+        let mut original = filled_rect(grid, 4, 4, 23, 23);
+        for y in 4..=13 {
+            for x in 14..=23 {
+                original[y * grid + x] = false; // carve the notch (known background)
+            }
+        }
+
+        let mask = Mask::from_bool_mask(
+            &original,
+            grid as u32,
+            grid as u32,
+            [grid as u32, grid as u32],
+            None,
+        );
+        let recovered = mask.to_bool_mask();
+
+        // Most of the L is recovered...
+        let score = mask_iou(&original, &recovered);
+        assert!(score >= 0.6, "round-trip IoU too low: {}", score);
+
+        // ...and the 100-px notch stays essentially empty (the discriminator).
+        let notch_filled = (4..=13)
+            .flat_map(|y| (14..=23).map(move |x| (x, y)))
+            .filter(|&(x, y)| recovered[y * grid + x])
+            .count();
+        assert!(
+            notch_filled <= 10,
+            "concavity flooded: {} px filled",
+            notch_filled
+        );
+    }
+
+    #[test]
+    fn test_bool_mask_area_approximates_pixel_count() {
+        let grid = 28u32;
+        let original = filled_rect(grid as usize, 4, 4, 23, 23); // 20x20 = 400 px
+        let mask = Mask::from_bool_mask(&original, grid, grid, [grid, grid], None);
+        let area = mask.area();
+        let expected = 400.0_f32;
+        assert!(
+            (area - expected).abs() / expected <= 0.15,
+            "area {} not within 15% of {}",
+            area,
+            expected
+        );
+    }
+
+    #[test]
+    fn test_bool_mask_two_components_two_polygons() {
+        let grid = 20usize;
+        let mut mask = vec![false; grid * grid];
+        for y in 2..=6 {
+            for x in 2..=6 {
+                mask[y * grid + x] = true;
+            }
+        }
+        for y in 12..=16 {
+            for x in 12..=16 {
+                mask[y * grid + x] = true;
+            }
+        }
+        let polys = bool_mask_to_polygons(&mask, grid as u32, grid as u32);
+        assert_eq!(polys.len(), 2, "two disjoint blobs -> two polygons");
+    }
+
+    #[test]
+    fn test_bool_mask_degenerate() {
+        // Empty mask -> no polygons.
+        assert!(bool_mask_to_polygons(&[false; 25], 5, 5).is_empty());
+        // Single pixel -> dropped as sub-3-point noise, no panic.
+        let mut one = vec![false; 25];
+        one[2 * 5 + 2] = true;
+        assert!(bool_mask_to_polygons(&one, 5, 5).is_empty());
     }
 }
