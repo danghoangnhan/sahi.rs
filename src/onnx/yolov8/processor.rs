@@ -110,8 +110,11 @@ impl YOLOv8Processor {
             )));
         }
 
-        // Detect and handle output format
-        let (_num_boxes, box_dim) = match self.output_format {
+        // Auto-detect the output layout from the actual tensor shape. YOLOv8 exports vary
+        // between Standard (1, box_dim, num_boxes) and Transposed (1, num_boxes, box_dim).
+        let format = Self::detect_output_format(output_shape, self.num_classes);
+
+        let (_num_boxes, box_dim) = match format {
             YOLOv8OutputFormat::Standard => {
                 // Standard: (1, 84, 8400) -> dim1 is box_dim, dim2 is num_boxes
                 (dim2, dim1)
@@ -135,8 +138,8 @@ impl YOLOv8Processor {
         let array = ArrayView2::from_shape((dim1, dim2), output)
             .map_err(|e| Error::invalid_output(format!("Failed to create array view: {}", e)))?;
 
-        // Process based on format
-        let detections = match self.output_format {
+        // Process based on the detected format
+        let detections = match format {
             YOLOv8OutputFormat::Standard => self.process_standard_output(&array, letterbox_info),
             YOLOv8OutputFormat::Transposed => {
                 self.process_transposed_output(&array, letterbox_info)
@@ -305,5 +308,43 @@ mod tests {
         assert_eq!(processor.num_classes, 80);
         assert_eq!(processor.confidence_threshold, 0.25);
         assert_eq!(processor.iou_threshold, 0.45);
+    }
+
+    #[test]
+    fn test_process_output_handles_standard_and_transposed() {
+        let num_classes = 2;
+        let processor = YOLOv8Processor::new(64, num_classes).with_confidence_threshold(0.1);
+
+        // Identity letterbox: scale 1, no padding, so decoded coords == model coords.
+        let info = crate::onnx::processor::LetterboxInfo {
+            orig_width: 100,
+            orig_height: 100,
+            target_width: 64,
+            target_height: 64,
+            pad_left: 0,
+            pad_top: 0,
+            scale: 1.0,
+        };
+
+        // One box: center (50, 50), size 20x20, class 0 score 0.1, class 1 score 0.9.
+        // Per-box layout: [x_center, y_center, w, h, score_c0, score_c1]
+        let data = vec![50.0, 50.0, 20.0, 20.0, 0.1, 0.9];
+
+        // Standard layout: (1, box_dim=6, num_boxes=1)
+        let standard = processor
+            .process_output(&data, &[1, 6, 1], &info)
+            .expect("standard layout should decode");
+        assert_eq!(standard.len(), 1);
+        assert_eq!(standard[0].class_id, 1);
+        assert!((standard[0].bbox.x - 40.0).abs() < 1e-3); // 50 - 20/2
+        assert!((standard[0].bbox.width - 20.0).abs() < 1e-3);
+
+        // Transposed layout: (1, num_boxes=1, box_dim=6) — same flat data, must auto-detect.
+        let transposed = processor
+            .process_output(&data, &[1, 1, 6], &info)
+            .expect("transposed layout should auto-detect and decode");
+        assert_eq!(transposed.len(), 1);
+        assert_eq!(transposed[0].class_id, 1);
+        assert!((transposed[0].bbox.x - 40.0).abs() < 1e-3);
     }
 }

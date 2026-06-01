@@ -299,8 +299,6 @@ impl Postprocessor {
             used[i] = true;
 
             let mut current = detections[i].clone();
-            let mut merge_count = 1;
-            let mut confidence_sum = current.confidence;
 
             // Greedily merge overlapping boxes
             for j in (i + 1)..detections.len() {
@@ -314,16 +312,13 @@ impl Postprocessor {
 
                 let score = self.match_score(&current.bbox, &detections[j].bbox);
                 if score > self.config.match_threshold {
-                    // Merge boxes
+                    // Merge boxes (union). Confidence stays at the group max: detections are
+                    // sorted by descending confidence, so `current` already holds the highest.
                     current.bbox = merge_boxes(&current.bbox, &detections[j].bbox);
-                    confidence_sum += detections[j].confidence;
-                    merge_count += 1;
                     used[j] = true;
                 }
             }
 
-            // Average confidence
-            current.confidence = confidence_sum / merge_count as f32;
             result.push(current);
         }
 
@@ -338,19 +333,17 @@ impl Postprocessor {
             return first.clone();
         }
 
-        // Merge all boxes
+        // Merge all boxes into the union. Detections are sorted by descending confidence and
+        // `indices[0]` is the first (highest) match, so `first.confidence` is the group max.
         let mut merged_bbox = first.bbox;
-        let mut confidence_sum = first.confidence;
-
         for &idx in indices.iter().skip(1) {
             merged_bbox = merge_boxes(&merged_bbox, &detections[idx].bbox);
-            confidence_sum += detections[idx].confidence;
         }
 
         Detection::new(
             merged_bbox,
             first.class_id,
-            confidence_sum / indices.len() as f32,
+            first.confidence,
             first.class_name.clone(),
         )
     }
@@ -462,8 +455,26 @@ mod tests {
         assert_eq!(result[0].bbox.y, 0.0);
         assert_eq!(result[0].bbox.width, 150.0);
         assert_eq!(result[0].bbox.height, 150.0);
-        // Confidence should be averaged
-        assert!((result[0].confidence - 0.85).abs() < 1e-6);
+        // Confidence is the max of the merged group (matches reference SAHI), not the average
+        assert!((result[0].confidence - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_nmm_keeps_max_confidence() {
+        let postprocessor = Postprocessor::new(
+            PostprocessConfig::new(0.1, 0.0).with_postprocess_type(PostprocessType::NMM),
+        );
+
+        let mut detections = vec![
+            Detection::new(BoundingBox::new(0.0, 0.0, 100.0, 100.0), 0, 0.9, None),
+            Detection::new(BoundingBox::new(50.0, 50.0, 100.0, 100.0), 0, 0.8, None),
+        ];
+
+        let result = postprocessor.nmm(&mut detections);
+
+        assert_eq!(result.len(), 1);
+        // Merged confidence is the max of the group, not the average
+        assert!((result[0].confidence - 0.9).abs() < 1e-6);
     }
 
     #[test]
