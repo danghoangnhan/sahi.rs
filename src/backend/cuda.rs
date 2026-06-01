@@ -157,6 +157,10 @@ impl CudaBackend {
     }
 
     /// Extract a slice from a source image on GPU using the default stream.
+    ///
+    /// Single-slice helper (the hot path uses `extract_slice_on_stream`); kept as a
+    /// reference implementation and exercised by tests.
+    #[allow(dead_code)]
     fn extract_slice_gpu(
         &self,
         src: &CudaSlice<u8>,
