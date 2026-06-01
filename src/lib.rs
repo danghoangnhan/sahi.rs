@@ -528,6 +528,23 @@ mod python {
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
         }
 
+        /// Run sliced instance-segmentation inference on an image.
+        ///
+        /// Args:
+        ///     image: numpy array (H, W, C) uint8 RGB
+        ///     callback: callable taking a numpy array and returning a list of MaskedDetection
+        ///
+        /// Returns:
+        ///     List of MaskedDetection objects with coordinates in original image space.
+        fn predict_instances(
+            &self,
+            _py: Python<'_>,
+            image: &Bound<'_, PyArray3<u8>>,
+            callback: PyObject,
+        ) -> PyResult<Vec<crate::segmentation::PyMaskedDetection>> {
+            crate::segmentation::python::run_predict_instances(&self.inner, image, callback)
+        }
+
         /// Get the backend name.
         fn backend_name(&self) -> &'static str {
             self.inner.backend_name()
@@ -615,6 +632,7 @@ mod python {
         m.add_class::<PostprocessType>()?;
         m.add_class::<MatchMetric>()?;
         m.add_class::<model::Category>()?;
+        m.add_class::<crate::segmentation::PyMaskedDetection>()?;
 
         // ONNX types (feature-gated)
         #[cfg(feature = "onnx")]

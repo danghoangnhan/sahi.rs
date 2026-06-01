@@ -270,6 +270,153 @@ fn union_masks(masks: &[Mask]) -> Option<Mask> {
     Some(Mask::new(polygons, shape, None))
 }
 
+// ============================================================================
+// Python bindings (sub-project 9c)
+// ============================================================================
+
+#[cfg(feature = "python")]
+pub(crate) mod python {
+    use numpy::{PyArray, PyArray2, PyArray3, PyArrayMethods, PyUntypedArrayMethods};
+    use pyo3::prelude::*;
+    use pyo3::types::PyList;
+
+    use crate::annotation::Mask;
+    use crate::detection::Detection;
+    use crate::error::{Error, Result};
+    use crate::inference::ImageData;
+
+    use super::{MaskedDetection, SegmentationCallback};
+
+    /// Python wrapper for a detection with an optional polygon mask (COCO format).
+    #[pyclass(name = "MaskedDetection")]
+    #[derive(Clone)]
+    pub struct PyMaskedDetection {
+        /// The underlying detection (bbox, class, confidence).
+        #[pyo3(get)]
+        detection: Detection,
+        /// Optional segmentation polygons, COCO `[[x1, y1, x2, y2, ...], ...]`.
+        polygons: Option<Vec<Vec<f32>>>,
+    }
+
+    #[pymethods]
+    impl PyMaskedDetection {
+        #[new]
+        #[pyo3(signature = (detection, mask=None))]
+        fn new(detection: Detection, mask: Option<Vec<Vec<f32>>>) -> Self {
+            Self {
+                detection,
+                polygons: mask,
+            }
+        }
+
+        /// Segmentation polygons (COCO format), or `None`.
+        #[getter]
+        fn mask(&self) -> Option<Vec<Vec<f32>>> {
+            self.polygons.clone()
+        }
+
+        /// Rasterize the polygon mask to a boolean numpy array of shape `(height, width)`.
+        fn mask_array<'py>(
+            &self,
+            py: Python<'py>,
+            height: u32,
+            width: u32,
+        ) -> PyResult<Bound<'py, PyArray2<bool>>> {
+            let polys = self.polygons.clone().unwrap_or_default();
+            let mask = Mask::new(polys, [height, width], None);
+            let flat = mask.to_bool_mask();
+            let arr = PyArray::from_vec(py, flat).reshape([height as usize, width as usize])?;
+            Ok(arr)
+        }
+
+        fn __repr__(&self) -> String {
+            format!(
+                "MaskedDetection(class_id={}, confidence={:.3}, has_mask={})",
+                self.detection.class_id,
+                self.detection.confidence,
+                self.polygons.is_some()
+            )
+        }
+    }
+
+    /// Adapter exposing a Python callback as a Rust [`SegmentationCallback`].
+    struct PySegCallback {
+        callback: PyObject,
+    }
+
+    // Safety: GIL-bound; only dereferenced within `Python::with_gil`.
+    unsafe impl Send for PySegCallback {}
+    unsafe impl Sync for PySegCallback {}
+
+    impl SegmentationCallback for PySegCallback {
+        fn infer(&self, image: &ImageData) -> Result<Vec<MaskedDetection>> {
+            Python::with_gil(|py| {
+                let array = PyArray::from_slice(py, &image.data);
+                let reshaped = array
+                    .reshape([
+                        image.height as usize,
+                        image.width as usize,
+                        image.channels as usize,
+                    ])
+                    .map_err(|e| Error::Inference(e.to_string()))?;
+
+                let result = self
+                    .callback
+                    .call1(py, (reshaped,))
+                    .map_err(|e| Error::Inference(e.to_string()))?;
+                let list = result.downcast_bound::<PyList>(py).map_err(|e| {
+                    Error::Inference(format!("Expected list of MaskedDetection: {}", e))
+                })?;
+
+                let mut out = Vec::with_capacity(list.len());
+                for item in list.iter() {
+                    let md: PyMaskedDetection = item
+                        .extract()
+                        .map_err(|e| Error::Inference(format!("Invalid MaskedDetection: {}", e)))?;
+                    // The callback's polygons are in slice coordinates; full_shape is the slice.
+                    let mask = md
+                        .polygons
+                        .map(|p| Mask::new(p, [image.height, image.width], None));
+                    out.push(MaskedDetection::new(md.detection, mask));
+                }
+                Ok(out)
+            })
+        }
+    }
+
+    /// Drive `Sahi::predict_instances` with a Python callback and wrap the results.
+    pub fn run_predict_instances(
+        inner: &crate::Sahi,
+        image: &Bound<'_, PyArray3<u8>>,
+        callback: PyObject,
+    ) -> PyResult<Vec<PyMaskedDetection>> {
+        let shape = image.shape();
+        let height = shape[0] as u32;
+        let width = shape[1] as u32;
+        let channels = shape[2] as u32;
+        // Safety: only read within this scope.
+        let arr = unsafe { image.as_array() };
+        let data: Vec<u8> = arr.iter().copied().collect();
+        let image_data = ImageData::new(data, width, height, channels);
+
+        let cb = PySegCallback { callback };
+        let results = inner
+            .predict_instances(&image_data, &cb)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        Ok(results
+            .into_iter()
+            .map(|md| PyMaskedDetection {
+                detection: md.detection,
+                polygons: md.mask.map(|m| m.to_coco_segmentation()),
+            })
+            .collect())
+    }
+}
+
+#[cfg(feature = "python")]
+pub use python::PyMaskedDetection;
+
 #[cfg(test)]
 mod tests {
     use super::*;
