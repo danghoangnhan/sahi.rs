@@ -1,14 +1,23 @@
 # sahi.rs
 
-A high-performance Rust implementation of [SAHI (Slicing Aided Hyper Inference)](https://github.com/obss/sahi) for improved small object detection through image slicing.
+A high-performance Rust implementation of [SAHI (Slicing Aided Hyper Inference)](https://github.com/obss/sahi) for improved small-object detection — and instance segmentation — through image slicing.
+
+## Capabilities
+
+- **Detection and instance segmentation** — `Sahi::predict` returns boxes; `Sahi::predict_instances` returns boxes with masks.
+- **Model-agnostic** — bring any detector or segmenter via a callback.
+- **Postprocessing** — NMS, NMM, and GREEDYNMM, with IoU or IoS matching (masks are unioned when boxes merge).
+- **CPU and GPU backends** — sequential, multi-threaded (the `parallel` feature, via rayon), or CUDA slice extraction.
+- **Built-in YOLOv8** — optional ONNX Runtime detector (CPU / CUDA / TensorRT execution providers).
+- **Python bindings** — native `sahi_rs` module via PyO3, accepting numpy arrays.
 
 ```mermaid
 flowchart LR
     A["Input Image"] --> B["Slicer"]
-    B -->|"overlapping tiles"| C["Backend (CPU/CUDA)"]
+    B -->|"overlapping tiles"| C["Backend (CPU / CUDA)"]
     C --> D["Your Model"]
-    D -->|"per-slice detections"| E["Postprocessor (NMS)"]
-    E --> F["Final Detections"]
+    D -->|"per-slice results"| E["Postprocessor (NMS / NMM / GREEDYNMM)"]
+    E --> F["Detections / Masks"]
 ```
 
 ## Quick Start
@@ -29,6 +38,10 @@ let model = callback(|img: &ImageData| {
 let detections = sahi.predict(&image, &model)?;
 ```
 
+For instance segmentation, return masks from a `SegmentationCallback` and call
+`sahi.predict_instances(&image, &seg_model)?` to get `MaskedDetection`s (boxes + masks)
+in image coordinates.
+
 ## Documentation
 
 Detailed documentation is available in the [Wiki](../../wiki):
@@ -44,16 +57,18 @@ Detailed documentation is available in the [Wiki](../../wiki):
 
 | Feature | Description |
 |---------|-------------|
-| `cuda` | GPU acceleration via cudarc |
+| `parallel` | CPU parallelism via rayon (multi-threaded slice extraction) |
+| `cuda` | GPU slice extraction via cudarc |
 | `python` | PyO3 Python bindings |
 | `onnx` | ONNX Runtime model inference |
-| `models` | `onnx` + image processing |
+| `models` | `onnx` + image processing (built-in YOLOv8) |
 | `models-cuda` | CUDA-accelerated ONNX |
 
 ```bash
-cargo check                    # CPU only
-cargo check --features cuda    # With CUDA
-cargo test                     # Run tests
+cargo check                       # CPU only
+cargo check --features parallel   # With CPU parallelism
+cargo check --features cuda       # With CUDA
+cargo test                        # Run tests
 ```
 
 ## License

@@ -15,8 +15,10 @@ use crate::model::Category;
 
 /// A complete object annotation with bounding box, optional mask, and category.
 ///
-/// This is the primary type for representing detection/annotation results
-/// in SAHI, supporting both object detection and instance segmentation.
+/// A COCO-style annotation type for import/export and coordinate manipulation
+/// (shift, clip, format conversion). It is *not* the sliced-inference result type:
+/// the pipeline returns `Detection` (boxes) or `MaskedDetection` (boxes + masks).
+/// Use `from_detection` / `to_detection` to convert between them.
 ///
 /// # Example
 ///
