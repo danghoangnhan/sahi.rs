@@ -281,6 +281,49 @@ impl YOLOv8Processor {
             YOLOv8OutputFormat::Standard
         }
     }
+
+    /// Split a batched output `(N, dim1, dim2)` and decode each image with its own
+    /// letterbox info, processing each image's slice as a batch-1 output.
+    pub fn process_batch_output(
+        &self,
+        data: &[f32],
+        shape: &[i64],
+        infos: &[LetterboxInfo],
+    ) -> Result<Vec<Vec<Detection>>> {
+        if shape.len() != 3 {
+            return Err(Error::invalid_output(format!(
+                "expected 3D batched output, got shape {:?}",
+                shape
+            )));
+        }
+        let n = shape[0] as usize;
+        let dim1 = shape[1] as usize;
+        let dim2 = shape[2] as usize;
+        let per = dim1 * dim2;
+
+        if infos.len() != n {
+            return Err(Error::invalid_output(format!(
+                "expected {} letterbox infos for batch size {}, got {}",
+                n,
+                n,
+                infos.len()
+            )));
+        }
+        if data.len() != n * per {
+            return Err(Error::invalid_output(format!(
+                "output length {} does not match N*dim1*dim2 = {}",
+                data.len(),
+                n * per
+            )));
+        }
+
+        let mut results = Vec::with_capacity(n);
+        for i in 0..n {
+            let sub = &data[i * per..(i + 1) * per];
+            results.push(self.process_output(sub, &[1, dim1 as i64, dim2 as i64], &infos[i])?);
+        }
+        Ok(results)
+    }
 }
 
 #[cfg(test)]
@@ -346,5 +389,39 @@ mod tests {
         assert_eq!(transposed.len(), 1);
         assert_eq!(transposed[0].class_id, 1);
         assert!((transposed[0].bbox.x - 40.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_process_batch_output_splits_per_image() {
+        let num_classes = 2;
+        let processor = YOLOv8Processor::new(64, num_classes).with_confidence_threshold(0.1);
+        let info = crate::onnx::processor::LetterboxInfo {
+            orig_width: 100,
+            orig_height: 100,
+            target_width: 64,
+            target_height: 64,
+            pad_left: 0,
+            pad_top: 0,
+            scale: 1.0,
+        };
+
+        // Batched (N=2, dim1=6, dim2=1). Per-box: [xc, yc, w, h, score_c0, score_c1].
+        // image 0 -> class 1 at center (50,50) 20x20; image 1 -> class 0 at (30,30) 10x10.
+        let data = vec![
+            50.0, 50.0, 20.0, 20.0, 0.1, 0.9, // image 0
+            30.0, 30.0, 10.0, 10.0, 0.8, 0.2, // image 1
+        ];
+        let shape = [2i64, 6, 1];
+        let infos = [info, info];
+
+        let out = processor
+            .process_batch_output(&data, &shape, &infos)
+            .unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].len(), 1);
+        assert_eq!(out[0][0].class_id, 1);
+        assert!((out[0][0].bbox.x - 40.0).abs() < 1e-3); // 50 - 20/2
+        assert_eq!(out[1][0].class_id, 0);
+        assert!((out[1][0].bbox.x - 25.0).abs() < 1e-3); // 30 - 10/2
     }
 }

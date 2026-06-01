@@ -12,6 +12,8 @@ use crate::model::{DetectionModel, ModelConfig};
 use crate::onnx::processor::ImageProcessor;
 use crate::onnx::session::{ExecutionProvider, OnnxSession, OnnxSessionBuilder};
 
+use ndarray::{concatenate, Array4, Axis};
+
 use super::processor::{YOLOv8OutputFormat, YOLOv8Processor};
 
 /// Configuration for YOLOv8 detector.
@@ -260,10 +262,60 @@ impl DetectionModel for YOLOv8Detector {
     }
 
     fn predict_batch(&self, images: &[ImageData]) -> Result<Vec<Vec<Detection>>> {
-        // For now, process sequentially
-        // TODO: Implement true batch processing
-        images.iter().map(|img| self.predict(img)).collect()
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let session_mutex = self.session.as_ref().ok_or(Error::ModelNotLoaded)?;
+        let mut session = session_mutex
+            .lock()
+            .map_err(|_| Error::inference("Session lock poisoned"))?;
+
+        // Preprocess every tile; letterbox normalizes each to input_size^2, so the
+        // tensors are uniform and can be stacked into one batch.
+        let mut tensors = Vec::with_capacity(images.len());
+        let mut infos = Vec::with_capacity(images.len());
+        for image in images {
+            let (tensor, info) = self.processor.preprocessor.preprocess(image)?;
+            tensors.push(tensor);
+            infos.push(info);
+        }
+
+        let batch = stack_nchw(&tensors)?;
+
+        let input_name = session
+            .input_name()
+            .ok_or_else(|| Error::invalid_output("Model has no input".to_string()))?
+            .to_string();
+        let output_name = session
+            .output_name()
+            .ok_or_else(|| Error::invalid_output("Model has no output".to_string()))?
+            .to_string();
+
+        let ort_input = ort::value::Tensor::from_array(batch.into_dyn())?;
+        let outputs = session
+            .session_mut()
+            .run(ort::inputs![&input_name => ort_input])?;
+
+        let output_value = outputs
+            .get(&output_name)
+            .ok_or_else(|| Error::invalid_output(format!("Output '{}' not found", output_name)))?;
+        let (output_shape, output_data) = output_value.try_extract_tensor::<f32>()?;
+        let shape: Vec<i64> = output_shape.iter().copied().collect();
+
+        self.processor
+            .process_batch_output(output_data, &shape, &infos)
     }
+}
+
+/// Stack N preprocessed `(1, C, H, W)` tensors into a single `(N, C, H, W)` batch.
+fn stack_nchw(tensors: &[Array4<f32>]) -> Result<Array4<f32>> {
+    if tensors.is_empty() {
+        return Err(Error::invalid_output("cannot stack an empty batch"));
+    }
+    let views: Vec<_> = tensors.iter().map(|t| t.view()).collect();
+    concatenate(Axis(0), &views)
+        .map_err(|e| Error::invalid_output(format!("failed to stack batch tensors: {}", e)))
 }
 
 #[cfg(test)]
@@ -294,5 +346,25 @@ mod tests {
     fn test_detector_not_loaded() {
         let detector = YOLOv8Detector::new("model.onnx");
         assert!(!detector.is_loaded());
+    }
+
+    #[test]
+    fn test_stack_nchw_stacks_along_batch() {
+        let mut a = Array4::<f32>::zeros((1, 1, 1, 2));
+        a[[0, 0, 0, 0]] = 1.0;
+        a[[0, 0, 0, 1]] = 2.0;
+        let mut b = Array4::<f32>::zeros((1, 1, 1, 2));
+        b[[0, 0, 0, 0]] = 3.0;
+        b[[0, 0, 0, 1]] = 4.0;
+
+        let batch = stack_nchw(&[a, b]).unwrap();
+        assert_eq!(batch.dim(), (2, 1, 1, 2));
+        assert_eq!(batch[[0, 0, 0, 0]], 1.0);
+        assert_eq!(batch[[1, 0, 0, 1]], 4.0);
+    }
+
+    #[test]
+    fn test_stack_nchw_empty_errors() {
+        assert!(stack_nchw(&[]).is_err());
     }
 }
