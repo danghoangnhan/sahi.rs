@@ -293,13 +293,8 @@ impl CudaBackend {
         let mut gpu_slices = Vec::with_capacity(chunk.len());
         for (i, s) in chunk.iter().enumerate() {
             let stream = &streams[i % streams.len()];
-            let gpu_slice = self.extract_slice_on_stream(
-                gpu_image,
-                image.width,
-                image.channels,
-                s,
-                stream,
-            )?;
+            let gpu_slice =
+                self.extract_slice_on_stream(gpu_image, image.width, image.channels, s, stream)?;
             gpu_slices.push(gpu_slice);
         }
         Ok(gpu_slices)
@@ -387,17 +382,13 @@ impl CudaBackend {
         let mut current_gpu_slices =
             self.extract_chunk_on_streams(gpu_image, image, chunks[0], streams)?;
         self.sync_streams(streams)?;
-        let mut current_images = self.download_chunk(&current_gpu_slices, chunks[0], image.channels)?;
+        let mut current_images =
+            self.download_chunk(&current_gpu_slices, chunks[0], image.channels)?;
 
         for i in 0..chunks.len() {
             // Start extracting next chunk asynchronously (if there is one)
             let next_gpu_slices = if i + 1 < chunks.len() {
-                Some(self.extract_chunk_on_streams(
-                    gpu_image,
-                    image,
-                    chunks[i + 1],
-                    streams,
-                )?)
+                Some(self.extract_chunk_on_streams(gpu_image, image, chunks[i + 1], streams)?)
             } else {
                 None
             };
@@ -717,12 +708,8 @@ mod tests {
             )])
         });
 
-        let single_result = single_backend
-            .process_slices(&image, &slices, &cb)
-            .unwrap();
-        let multi_result = multi_backend
-            .process_slices(&image, &slices, &cb)
-            .unwrap();
+        let single_result = single_backend.process_slices(&image, &slices, &cb).unwrap();
+        let multi_result = multi_backend.process_slices(&image, &slices, &cb).unwrap();
 
         assert_eq!(single_result.len(), multi_result.len());
         for (s, m) in single_result.iter().zip(multi_result.iter()) {

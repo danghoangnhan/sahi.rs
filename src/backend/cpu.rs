@@ -23,7 +23,6 @@ pub struct CpuBackendConfig {
     pub parallel_inference: bool,
 }
 
-
 /// CPU backend for slice processing.
 ///
 /// When the `parallel` feature is enabled, slice extraction is parallelized
