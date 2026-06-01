@@ -238,6 +238,13 @@ impl SahiBuilder {
         self
     }
 
+    /// Keep edge tiles full-size (shifted flush to the image edge) instead of
+    /// clipping them at the right/bottom edges.
+    pub fn fixed_size_tiles(mut self, enabled: bool) -> Self {
+        self.slicer_config.fixed_size = enabled;
+        self
+    }
+
     /// Set the match threshold for postprocessing.
     ///
     /// Predictions with match score (IOU or IOS) above this threshold

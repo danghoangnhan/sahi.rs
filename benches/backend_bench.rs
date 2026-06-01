@@ -18,6 +18,7 @@ fn make_slices(width: u32, height: u32) -> Vec<sahi::slicer::Slice> {
         slice_height: 640,
         overlap_width_ratio: 0.2,
         overlap_height_ratio: 0.2,
+        ..Default::default()
     };
     let slicer = Slicer::new(config);
     slicer.slice(width, height)
