@@ -39,23 +39,38 @@ impl ImageData {
     }
 
     /// Extract a slice of the image.
+    ///
+    /// The result is always `w * h * channels` bytes. Any region outside the source
+    /// image — past the right or bottom edge, or starting beyond it — is zero-padded,
+    /// so the returned dimensions and buffer length are always consistent.
     pub fn extract_slice(&self, x: u32, y: u32, w: u32, h: u32) -> ImageData {
-        let mut slice_data = Vec::with_capacity((w * h * self.channels) as usize);
+        let c = self.channels as usize;
+        let row_len = w as usize * c;
+        let mut slice_data = vec![0u8; row_len * h as usize];
 
-        for row in y..(y + h).min(self.height) {
-            let start = ((row * self.width + x) * self.channels) as usize;
-            let end = ((row * self.width + x + w.min(self.width - x)) * self.channels) as usize;
+        // Source columns available from `x` (0 if `x` is past the right edge).
+        let avail_cols = if x < self.width {
+            (self.width - x).min(w) as usize
+        } else {
+            0
+        };
 
-            if start < self.data.len() {
-                let actual_end = end.min(self.data.len());
-                slice_data.extend_from_slice(&self.data[start..actual_end]);
-
-                // Pad if needed
-                let expected_len = (w * self.channels) as usize;
-                let actual_len = actual_end - start;
-                if actual_len < expected_len {
-                    slice_data.extend(std::iter::repeat_n(0, expected_len - actual_len));
+        if avail_cols > 0 {
+            let copy_len = avail_cols * c;
+            for out_row in 0..h as usize {
+                let src_row = y as usize + out_row;
+                if src_row >= self.height as usize {
+                    break; // rows past the bottom edge stay zero-padded
                 }
+                let src_start = (src_row * self.width as usize + x as usize) * c;
+                if src_start >= self.data.len() {
+                    break;
+                }
+                let src_end = (src_start + copy_len).min(self.data.len());
+                let dst_start = out_row * row_len;
+                let n = src_end - src_start;
+                slice_data[dst_start..dst_start + n]
+                    .copy_from_slice(&self.data[src_start..src_end]);
             }
         }
 
@@ -195,6 +210,35 @@ mod tests {
         assert_eq!(slice.width, 2);
         assert_eq!(slice.height, 2);
         assert_eq!(slice.data.len(), 12); // 2x2x3
+    }
+
+    #[test]
+    fn test_extract_slice_pads_out_of_bounds_rows() {
+        // 4x4 RGB (values 0..48). A 4x4 slice at (2,2) overruns both edges; only a
+        // 2x2 region is in-bounds.
+        let data: Vec<u8> = (0..48).collect();
+        let img = ImageData::from_rgb(data, 4, 4);
+        let slice = img.extract_slice(2, 2, 4, 4);
+
+        assert_eq!(slice.width, 4);
+        assert_eq!(slice.height, 4);
+        assert_eq!(slice.data.len(), 4 * 4 * 3); // always w*h*channels (zero-padded)
+
+        // Top-left of the slice is source pixel (2,2) = byte offset (2*4+2)*3 = 30.
+        assert_eq!(&slice.data[0..3], &[30, 31, 32]);
+        // A row beyond the source bottom stays zero.
+        let row3 = 3 * 4 * 3;
+        assert_eq!(&slice.data[row3..row3 + 3], &[0, 0, 0]);
+    }
+
+    #[test]
+    fn test_extract_slice_x_beyond_width_is_zero() {
+        let data: Vec<u8> = (0..48).collect();
+        let img = ImageData::from_rgb(data, 4, 4);
+        // x past the right edge: no source columns -> all zeros, and no panic.
+        let slice = img.extract_slice(5, 0, 2, 2);
+        assert_eq!(slice.data.len(), 2 * 2 * 3);
+        assert!(slice.data.iter().all(|&b| b == 0));
     }
 
     #[test]
