@@ -26,6 +26,13 @@ use super::processor::YOLOv8OutputFormat;
 /// Number of mask prototypes/coefficients in a standard YOLOv8-seg export.
 pub const DEFAULT_NUM_MASKS: u32 = 32;
 
+/// Maximum number of pixels (`orig_width * orig_height`) a single decoded mask
+/// buffer may cover. `decode_mask` allocates one `f32` per pixel per surviving
+/// detection at full slice resolution, so an absurd image size (e.g. 60000²)
+/// would request many gigabytes. 64M pixels (~256 MiB per `f32` buffer) is a sane
+/// upper bound that still comfortably covers real images.
+const MAX_MASK_PIXELS: u64 = 64 * 1024 * 1024;
+
 /// Configuration for [`YOLOv8SegDetector`].
 #[derive(Debug, Clone)]
 pub struct YOLOv8SegConfig {
@@ -225,10 +232,22 @@ impl YOLOv8SegProcessor {
             )));
         }
         let format = self.detect_seg_output_format(out0_shape);
-        let num_boxes = match format {
-            YOLOv8OutputFormat::Standard => dim2,
-            YOLOv8OutputFormat::Transposed => dim1,
+        let (num_boxes, found_box_dim) = match format {
+            YOLOv8OutputFormat::Standard => (dim2, dim1),
+            YOLOv8OutputFormat::Transposed => (dim1, dim2),
         };
+
+        // Validate the box dimension. `detect_seg_output_format` silently falls back to
+        // Standard when neither dim matches `box_dim`, so without this guard a model
+        // whose box-dim differs (e.g. (1,5,8400) with a 116-dim config) would drive the
+        // `get(b, 4+c)` reads below out of bounds and panic. Mirror the detection path.
+        let expected_box_dim = self.box_dim();
+        if found_box_dim != expected_box_dim {
+            return Err(Error::invalid_output(format!(
+                "expected {} features per box (4 + {} classes + {} masks), got {}",
+                expected_box_dim, self.num_classes, self.num_masks, found_box_dim
+            )));
+        }
 
         let array = ArrayView2::from_shape((dim1, dim2), out0).map_err(|e| {
             Error::invalid_output(format!("failed to view detection output: {}", e))
@@ -318,7 +337,7 @@ impl YOLOv8SegProcessor {
         let mut results = Vec::with_capacity(keep.len());
         for &i in &keep {
             let c = &candidates[i];
-            let mask = self.decode_mask(&c.coeffs, &c.bbox, proto, nm, mh, mw, info);
+            let mask = self.decode_mask(&c.coeffs, &c.bbox, proto, nm, mh, mw, info)?;
             results.push(MaskedDetection::new(
                 Detection::new(c.bbox, c.class_id, c.confidence, None),
                 Some(mask),
@@ -342,7 +361,18 @@ impl YOLOv8SegProcessor {
         mh: usize,
         mw: usize,
         info: &LetterboxInfo,
-    ) -> Mask {
+    ) -> Result<Mask> {
+        // Bound the per-mask allocation: this buffer is `orig_width * orig_height`
+        // f32s, so an absurd image size would request many GB and OOM. Compute the
+        // product in u64 to avoid the multiply itself overflowing.
+        let pixels = info.orig_width as u64 * info.orig_height as u64;
+        if pixels > MAX_MASK_PIXELS {
+            return Err(Error::invalid_output(format!(
+                "mask resolution {}x{} = {} pixels exceeds cap {}",
+                info.orig_width, info.orig_height, pixels, MAX_MASK_PIXELS
+            )));
+        }
+
         let ow = info.orig_width as usize;
         let oh = info.orig_height as usize;
 
@@ -371,14 +401,14 @@ impl YOLOv8SegProcessor {
             }
         }
 
-        Mask::from_float_mask(
+        Ok(Mask::from_float_mask(
             &mask,
             ow as u32,
             oh as u32,
             self.mask_threshold,
             [oh as u32, ow as u32],
             None,
-        )
+        ))
     }
 }
 
@@ -606,6 +636,51 @@ mod tests {
         assert_eq!(dets.len(), 1);
         let mask = dets[0].mask.as_ref().expect("mask present");
         assert!(pixel(mask, 3, 3));
+    }
+
+    #[test]
+    fn test_process_seg_output_mismatched_box_dim_returns_err() {
+        // num_classes=1, num_masks=1 -> box_dim = 6. Feed an output whose box-dim
+        // matches neither dim1 (5) nor dim2 (3). detect_seg_output_format silently
+        // returns Standard, so the decode loop would index get(b, 4+c) out of bounds.
+        // The processor must validate the box dimension and return Err instead.
+        let p = YOLOv8SegProcessor::new(8, 1, 1).with_confidence_threshold(0.1);
+        let info = identity_info(8);
+        // Shape (1, 5, 3): dim1=5 (not 6), dim2=3 (not 6). 5*3 = 15 elements.
+        let out0 = vec![0.5f32; 15];
+        let proto = proto_block_8x8();
+        let res = p.process_seg_output(&out0, &[1, 5, 3], &proto, &[1, 1, 8, 8], &info);
+        assert!(
+            res.is_err(),
+            "mismatched box-dim must return Err, not panic/OOB"
+        );
+    }
+
+    #[test]
+    fn test_process_seg_output_absurd_orig_dims_returns_err() {
+        // A surviving detection with absurd original image dimensions would drive
+        // decode_mask to allocate ow*oh f32s (~many GB). The processor must reject
+        // such dimensions and return Err rather than attempting the allocation.
+        // box_dim = 6 here, matching dim1, so we reach the decode path with one box.
+        let p = YOLOv8SegProcessor::new(8, 1, 1).with_confidence_threshold(0.1);
+        // orig_width * orig_height = 100_000 * 100_000 = 1e10 pixels, far over the cap.
+        let info = LetterboxInfo {
+            orig_width: 100_000,
+            orig_height: 100_000,
+            target_width: 8,
+            target_height: 8,
+            pad_left: 0,
+            pad_top: 0,
+            scale: 8.0 / 100_000.0,
+        };
+        // One box covering a small region; mask coeff high so it passes threshold.
+        let out0 = vec![4.0, 4.0, 4.0, 4.0, 0.9, 10.0];
+        let proto = proto_block_8x8();
+        let res = p.process_seg_output(&out0, &[1, 6, 1], &proto, &[1, 1, 8, 8], &info);
+        assert!(
+            res.is_err(),
+            "absurd orig dims must return Err, not attempt a huge allocation"
+        );
     }
 
     #[test]
