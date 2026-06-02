@@ -44,6 +44,9 @@ jobs:
       - name: Check (models feature)
         run: cargo check --features models
 
+      - name: Check (cuda feature)
+        run: cargo check --features cuda
+
   test:
     name: Test
     runs-on: ubuntu-latest
