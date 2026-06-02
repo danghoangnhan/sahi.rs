@@ -52,6 +52,20 @@ def test_mask_array_rasterizes_polygon():
     assert not bool(arr[45, 45])  # outside
 
 
+def test_mask_array_rejects_huge_dimensions():
+    from sahi_rs import BoundingBox, Detection, MaskedDetection
+
+    det = Detection(
+        bbox=BoundingBox(x=0.0, y=0.0, width=10.0, height=10.0),
+        class_id=0,
+        confidence=0.9,
+    )
+    md = MaskedDetection(det, [[0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0]])
+    # ~1e10 pixels would be a multi-GB allocation; must raise, not OOM.
+    with pytest.raises(ValueError):
+        md.mask_array(100000, 100000)
+
+
 def test_predict_instances_returns_image_space_masks():
     from sahi_rs import BoundingBox, Detection, MaskedDetection, Sahi
 

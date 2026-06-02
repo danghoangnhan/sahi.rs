@@ -291,6 +291,16 @@ pub(crate) mod python {
             height: u32,
             width: u32,
         ) -> PyResult<Bound<'py, PyArray2<bool>>> {
+            // Bound the allocation: arbitrary u32 dims from Python could otherwise
+            // request a multi-gigabyte buffer and abort the process.
+            const MAX_MASK_PIXELS: u64 = 64 * 1024 * 1024; // ~64M pixels (~64 MB)
+            let pixels = height as u64 * width as u64;
+            if pixels > MAX_MASK_PIXELS {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "mask_array dimensions {}x{} ({} pixels) exceed the {}-pixel limit",
+                    width, height, pixels, MAX_MASK_PIXELS
+                )));
+            }
             let polys = self.polygons.clone().unwrap_or_default();
             let mask = Mask::new(polys, [height, width], None);
             let flat = mask.to_bool_mask();

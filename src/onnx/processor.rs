@@ -256,7 +256,12 @@ pub fn nms(
 
     // Sort by confidence (descending)
     let mut indices: Vec<usize> = (0..boxes.len()).collect();
-    indices.sort_by(|&a, &b| boxes[b].4.partial_cmp(&boxes[a].4).unwrap());
+    indices.sort_by(|&a, &b| {
+        boxes[b]
+            .4
+            .partial_cmp(&boxes[a].4)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let mut keep = Vec::new();
     let mut suppressed = vec![false; boxes.len()];
@@ -330,6 +335,18 @@ fn compute_iou(x1: f32, y1: f32, w1: f32, h1: f32, x2: f32, y2: f32, w2: f32, h2
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_nms_handles_nan_confidence_without_panic() {
+        // A NaN confidence must not panic the sort.
+        let boxes = vec![
+            (0.0, 0.0, 10.0, 10.0, 0.9, 0u32),
+            (1.0, 1.0, 10.0, 10.0, f32::NAN, 0u32),
+            (100.0, 100.0, 10.0, 10.0, 0.5, 0u32),
+        ];
+        let keep = nms(&boxes, 0.5);
+        assert!(!keep.is_empty());
+    }
 
     #[test]
     fn test_letterbox_info_mapping() {
