@@ -165,7 +165,7 @@ impl CudaBackend {
         &self,
         src: &CudaSlice<u8>,
         src_width: u32,
-        _src_height: u32,
+        src_height: u32,
         channels: u32,
         slice: &Slice,
     ) -> Result<CudaSlice<u8>> {
@@ -178,7 +178,8 @@ impl CudaBackend {
             return Err(Error::gpu("Slice extraction kernel not loaded"));
         }
 
-        let output_size = (slice.width * slice.height * channels) as usize;
+        // Compute in usize to avoid u32 overflow on large slices/channels (#47).
+        let output_size = slice.width as usize * slice.height as usize * channels as usize;
 
         let dst: CudaSlice<u8> = device
             .alloc_zeros(output_size)
@@ -207,6 +208,7 @@ impl CudaBackend {
                     src,
                     &dst,
                     src_width,
+                    src_height,
                     slice.x,
                     slice.y,
                     slice.width,
@@ -229,6 +231,7 @@ impl CudaBackend {
         &self,
         src: &CudaSlice<u8>,
         src_width: u32,
+        src_height: u32,
         channels: u32,
         slice: &Slice,
         stream: &CudaStream,
@@ -242,7 +245,8 @@ impl CudaBackend {
             return Err(Error::gpu("Slice extraction kernel not loaded"));
         }
 
-        let output_size = (slice.width * slice.height * channels) as usize;
+        // Compute in usize to avoid u32 overflow on large slices/channels (#47).
+        let output_size = slice.width as usize * slice.height as usize * channels as usize;
 
         let dst: CudaSlice<u8> = device
             .alloc_zeros(output_size)
@@ -272,6 +276,7 @@ impl CudaBackend {
                     src,
                     &dst,
                     src_width,
+                    src_height,
                     slice.x,
                     slice.y,
                     slice.width,
@@ -297,8 +302,14 @@ impl CudaBackend {
         let mut gpu_slices = Vec::with_capacity(chunk.len());
         for (i, s) in chunk.iter().enumerate() {
             let stream = &streams[i % streams.len()];
-            let gpu_slice =
-                self.extract_slice_on_stream(gpu_image, image.width, image.channels, s, stream)?;
+            let gpu_slice = self.extract_slice_on_stream(
+                gpu_image,
+                image.width,
+                image.height,
+                image.channels,
+                s,
+                stream,
+            )?;
             gpu_slices.push(gpu_slice);
         }
         Ok(gpu_slices)
@@ -521,24 +532,34 @@ pub mod kernels {
     ///
     /// Extracts a rectangular slice from a source image, copying all channels per pixel.
     /// Each thread handles one pixel (all channels).
+    ///
+    /// Source-bounds handling (matches the CPU `ImageData::extract_slice` zero-pad
+    /// semantics, #38): a thread whose source coordinate
+    /// `(slice_x + dst_x, slice_y + dst_y)` falls outside `src_width` x `src_height`
+    /// writes zeros for that pixel's channels instead of reading out-of-bounds device
+    /// memory. The destination is allocated with `alloc_zeros`, so the explicit
+    /// zero-write is belt-and-suspenders but keeps the kernel correct independent of
+    /// the caller's allocation choice.
     pub const SLICE_EXTRACT_PTX: &str = r#"
 .version 7.0
 .target sm_50
 .address_size 64
 
-// extract_slice_kernel(src, dst, src_width, slice_x, slice_y, slice_width, slice_height, channels)
+// extract_slice_kernel(src, dst, src_width, src_height,
+//                       slice_x, slice_y, slice_width, slice_height, channels)
 .visible .entry extract_slice_kernel(
     .param .u64 src_ptr,
     .param .u64 dst_ptr,
     .param .u32 src_width,
+    .param .u32 src_height,
     .param .u32 slice_x,
     .param .u32 slice_y,
     .param .u32 slice_width,
     .param .u32 slice_height,
     .param .u32 channels
 ) {
-    .reg .pred %p<2>;
-    .reg .b32 %r<17>;
+    .reg .pred %p<3>;
+    .reg .b32 %r<22>;
     .reg .b64 %rd<9>;
 
     // Thread coordinates
@@ -552,43 +573,55 @@ pub mod kernels {
     mov.u32 %r7, %tid.y;
     mad.lo.u32 %r8, %r5, %r6, %r7;  // dst_y
 
-    // Load parameters
+    // Load destination geometry
     ld.param.u32 %r9, [slice_width];
     ld.param.u32 %r10, [slice_height];
 
-    // Bounds check
+    // Destination bounds check: ignore threads outside the slice grid.
     setp.ge.u32 %p0, %r4, %r9;
     setp.ge.u32 %p1, %r8, %r10;
     or.pred %p0, %p0, %p1;
     @%p0 bra done;
 
-    // Calculate source and destination offsets
+    // Load remaining parameters
     ld.param.u32 %r11, [slice_x];
     ld.param.u32 %r12, [slice_y];
     ld.param.u32 %r13, [src_width];
     ld.param.u32 %r14, [channels];
+    ld.param.u32 %r19, [src_height];
 
-    // src_offset = ((slice_y + dst_y) * src_width + (slice_x + dst_x)) * channels
-    add.u32 %r15, %r12, %r8;             // slice_y + dst_y
-    mad.lo.u32 %r15, %r15, %r13, %r11;   // * src_width + slice_x
-    add.u32 %r15, %r15, %r4;             // + dst_x
-    mul.lo.u32 %r15, %r15, %r14;         // * channels
+    // src_x = slice_x + dst_x, src_y = slice_y + dst_y
+    add.u32 %r17, %r11, %r4;             // src_x
+    add.u32 %r18, %r12, %r8;             // src_y
 
     // dst_offset = (dst_y * slice_width + dst_x) * channels
     mad.lo.u32 %r16, %r8, %r9, %r4;
     mul.lo.u32 %r16, %r16, %r14;
 
-    // Compute base pointers for this pixel
-    ld.param.u64 %rd1, [src_ptr];
+    // dst base pointer for this pixel
     ld.param.u64 %rd2, [dst_ptr];
-    cvt.u64.u32 %rd3, %r15;
     cvt.u64.u32 %rd4, %r16;
-    add.u64 %rd5, %rd1, %rd3;   // src base for this pixel
     add.u64 %rd6, %rd2, %rd4;   // dst base for this pixel
 
-    // Loop over all channels
+    // Source bounds check (zero-pad semantics): if src_x >= src_width
+    // or src_y >= src_height, this pixel lies outside the source image.
+    setp.ge.u32 %p0, %r17, %r13;
+    setp.ge.u32 %p1, %r18, %r19;
+    or.pred %p0, %p0, %p1;
+    @%p0 bra zero_fill;
+
+    // src_offset = (src_y * src_width + src_x) * channels
+    mad.lo.u32 %r15, %r18, %r13, %r17;   // src_y * src_width + src_x
+    mul.lo.u32 %r15, %r15, %r14;         // * channels
+
+    // src base pointer for this pixel
+    ld.param.u64 %rd1, [src_ptr];
+    cvt.u64.u32 %rd3, %r15;
+    add.u64 %rd5, %rd1, %rd3;   // src base for this pixel
+
+    // Copy all channels
     mov.u32 %r0, 0;
-channel_loop:
+copy_loop:
     setp.ge.u32 %p0, %r0, %r14;
     @%p0 bra done;
 
@@ -600,7 +633,22 @@ channel_loop:
     st.global.u8 [%rd4], %r1;
 
     add.u32 %r0, %r0, 1;
-    bra channel_loop;
+    bra copy_loop;
+
+zero_fill:
+    // Out-of-source pixel: write zeros for all channels (zero-pad).
+    mov.u32 %r0, 0;
+    mov.u32 %r20, 0;
+zero_loop:
+    setp.ge.u32 %p0, %r0, %r14;
+    @%p0 bra done;
+
+    cvt.u64.u32 %rd7, %r0;
+    add.u64 %rd4, %rd6, %rd7;   // dst + channel offset
+    st.global.u8 [%rd4], %r20;
+
+    add.u32 %r0, %r0, 1;
+    bra zero_loop;
 
 done:
     ret;
@@ -657,10 +705,13 @@ mod tests {
     #[test]
     fn test_ptx_source_validity() {
         assert!(kernels::SLICE_EXTRACT_PTX.contains("extract_slice_kernel"));
-        assert!(kernels::SLICE_EXTRACT_PTX.contains("channel_loop"));
+        assert!(kernels::SLICE_EXTRACT_PTX.contains("copy_loop"));
         assert!(kernels::SLICE_EXTRACT_PTX.contains(".entry"));
         assert!(kernels::SLICE_EXTRACT_PTX.contains("ld.global.u8"));
         assert!(kernels::SLICE_EXTRACT_PTX.contains("st.global.u8"));
+        // Source-bounds / zero-pad support (#38).
+        assert!(kernels::SLICE_EXTRACT_PTX.contains("src_height"));
+        assert!(kernels::SLICE_EXTRACT_PTX.contains("zero_fill"));
     }
 
     #[test]
@@ -685,6 +736,59 @@ mod tests {
         // Compare with CPU extraction
         let cpu_result = image.extract_slice(1, 1, 2, 2);
         assert_eq!(result, cpu_result.data);
+    }
+
+    /// CPU/GPU parity for edge and oversized slices — the zero-pad path added in #38.
+    ///
+    /// This requires a real CUDA device with the slice kernel loaded and therefore
+    /// early-returns in CI / on this machine (no GPU). To exercise it on a GPU host:
+    ///
+    /// ```text
+    /// cargo test --features cuda backend::cuda::tests::test_extract_slice_edge_zero_pad_matches_cpu -- --nocapture
+    /// ```
+    ///
+    /// On a host without a device it prints a skip notice and passes trivially.
+    #[test]
+    fn test_extract_slice_edge_zero_pad_matches_cpu() {
+        let backend = CudaBackend::new();
+        if !backend.is_available() || !backend.kernel_loaded() {
+            println!("Skipping GPU parity test: CUDA not available or kernel not loaded");
+            return;
+        }
+
+        // 4x4 RGB source with known values.
+        let data: Vec<u8> = (0..48).collect();
+        let image = ImageData::from_rgb(data, 4, 4);
+        let gpu_image = backend.upload_image(&image).unwrap();
+
+        // Slices that read past the right/bottom edge or start beyond it. The CPU
+        // path zero-pads these regions; the GPU kernel must match byte-for-byte.
+        let cases = [
+            Slice::new(2, 2, 4, 4, 0), // overruns right and bottom edges
+            Slice::new(3, 0, 3, 2, 1), // overruns right edge only
+            Slice::new(0, 3, 2, 3, 2), // overruns bottom edge only
+            Slice::new(4, 4, 2, 2, 3), // starts entirely outside -> all zeros
+        ];
+
+        for slice in cases {
+            let gpu_result = backend
+                .extract_slice_gpu(
+                    &gpu_image,
+                    image.width,
+                    image.height,
+                    image.channels,
+                    &slice,
+                )
+                .unwrap();
+            let gpu_bytes = backend.download(&gpu_result).unwrap();
+
+            let cpu = image.extract_slice(slice.x, slice.y, slice.width, slice.height);
+            assert_eq!(
+                gpu_bytes, cpu.data,
+                "GPU/CPU mismatch for slice {:?}",
+                slice
+            );
+        }
     }
 
     #[test]
