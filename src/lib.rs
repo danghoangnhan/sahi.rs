@@ -40,6 +40,7 @@
 
 pub mod annotation;
 pub mod backend;
+mod combine;
 pub mod detection;
 pub mod error;
 pub mod inference;
