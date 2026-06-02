@@ -602,6 +602,51 @@ mod tests {
         assert!(union_masks(&[]).is_none());
     }
 
+    /// Records how the pipeline invokes the callback.
+    struct CountingSeg {
+        infer_calls: std::sync::atomic::AtomicUsize,
+        batch_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SegmentationCallback for CountingSeg {
+        fn infer(&self, _image: &ImageData) -> Result<Vec<MaskedDetection>> {
+            self.infer_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+        fn infer_batch(&self, images: &[ImageData]) -> Result<Vec<Vec<MaskedDetection>>> {
+            self.batch_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(images.iter().map(|_| Vec::new()).collect())
+        }
+    }
+
+    #[test]
+    fn test_predict_instances_extracts_and_infers_through_backend_batch() {
+        use std::sync::atomic::Ordering;
+        // 200x100 image, 100x100 slices, no overlap -> two slices.
+        let image = ImageData::from_rgb(vec![0u8; 200 * 100 * 3], 200, 100);
+        let sahi = Sahi::builder()
+            .slice_size(100, 100)
+            .overlap(0.0, 0.0)
+            .build();
+        let cb = CountingSeg {
+            infer_calls: std::sync::atomic::AtomicUsize::new(0),
+            batch_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let _ = sahi.predict_instances(&image, &cb).unwrap();
+        assert_eq!(
+            cb.batch_calls.load(Ordering::SeqCst),
+            1,
+            "slices should be inferred through a single infer_batch call"
+        );
+        assert_eq!(
+            cb.infer_calls.load(Ordering::SeqCst),
+            0,
+            "slices should not be inferred one-by-one via infer"
+        );
+    }
+
     #[test]
     fn test_union_masks_dedups_overlapping_into_single_polygon() {
         // Two overlapping 50x50 squares on a 100x100 canvas form one connected region.
