@@ -296,10 +296,24 @@ impl YOLOv8Processor {
                 shape
             )));
         }
+        // Validate dims are non-negative before casting: a negative i64 cast to usize
+        // becomes ~usize::MAX and the multiplies below overflow.
+        if shape.iter().any(|&d| d < 0) {
+            return Err(Error::invalid_output(format!(
+                "batched output dims must be non-negative, got shape {:?}",
+                shape
+            )));
+        }
         let n = shape[0] as usize;
         let dim1 = shape[1] as usize;
         let dim2 = shape[2] as usize;
-        let per = dim1 * dim2;
+        // Use checked arithmetic: untrusted dims could otherwise overflow usize.
+        let per = dim1
+            .checked_mul(dim2)
+            .ok_or_else(|| Error::invalid_output("batched output dims overflow".to_string()))?;
+        let total = n
+            .checked_mul(per)
+            .ok_or_else(|| Error::invalid_output("batched output dims overflow".to_string()))?;
 
         if infos.len() != n {
             return Err(Error::invalid_output(format!(
@@ -309,11 +323,11 @@ impl YOLOv8Processor {
                 infos.len()
             )));
         }
-        if data.len() != n * per {
+        if data.len() != total {
             return Err(Error::invalid_output(format!(
                 "output length {} does not match N*dim1*dim2 = {}",
                 data.len(),
-                n * per
+                total
             )));
         }
 
@@ -458,5 +472,51 @@ mod tests {
         assert!((out[0][0].bbox.x - 40.0).abs() < 1e-3); // 50 - 20/2
         assert_eq!(out[1][0].class_id, 0);
         assert!((out[1][0].bbox.x - 25.0).abs() < 1e-3); // 30 - 10/2
+    }
+
+    #[test]
+    fn test_process_batch_output_negative_dim_returns_err() {
+        // A negative i64 dim casts to a huge usize; `dim1 * dim2` then overflows
+        // (debug panic / release wrap). The processor must validate dims >= 0 and
+        // return Err before multiplying.
+        let processor = YOLOv8Processor::new(64, 2);
+        let info = crate::onnx::processor::LetterboxInfo {
+            orig_width: 100,
+            orig_height: 100,
+            target_width: 64,
+            target_height: 64,
+            pad_left: 0,
+            pad_top: 0,
+            scale: 1.0,
+        };
+        let data = vec![0.0f32; 6];
+        // dim1 = -1 -> usize::MAX after cast.
+        let shape = [1i64, -1, 6];
+        let infos = [info];
+        let res = processor.process_batch_output(&data, &shape, &infos);
+        assert!(res.is_err(), "negative dim must return Err, not panic");
+    }
+
+    #[test]
+    fn test_process_batch_output_overflowing_dims_returns_err() {
+        // Two huge positive dims whose product overflows usize. Must return Err via
+        // checked_mul, not panic/wrap.
+        let processor = YOLOv8Processor::new(64, 2);
+        let info = crate::onnx::processor::LetterboxInfo {
+            orig_width: 100,
+            orig_height: 100,
+            target_width: 64,
+            target_height: 64,
+            pad_left: 0,
+            pad_top: 0,
+            scale: 1.0,
+        };
+        let data = vec![0.0f32; 6];
+        // dim1 * dim2 overflows usize (both ~2^48 -> product ~2^96).
+        let big = 1i64 << 48;
+        let shape = [1i64, big, big];
+        let infos = [info];
+        let res = processor.process_batch_output(&data, &shape, &infos);
+        assert!(res.is_err(), "overflowing dims must return Err, not panic");
     }
 }

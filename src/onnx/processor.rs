@@ -142,6 +142,15 @@ impl Preprocessor {
         let target_h = self.target_height;
         let target_w = self.target_width;
 
+        // Reject degenerate images: a 0 dimension makes `orig_w as usize - 1`
+        // underflow (debug panic / release wrap to usize::MAX -> corrupted indices).
+        if orig_w == 0 || orig_h == 0 {
+            return Err(Error::preprocessing(format!(
+                "image dimensions must be non-zero, got {}x{}",
+                orig_w, orig_h
+            )));
+        }
+
         // Calculate scale to fit image in target while maintaining aspect ratio
         let scale = (target_w as f32 / orig_w as f32).min(target_h as f32 / orig_h as f32);
 
@@ -335,6 +344,30 @@ fn compute_iou(x1: f32, y1: f32, w1: f32, h1: f32, x2: f32, y2: f32, w2: f32, h2
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_letterbox_zero_width_returns_err() {
+        // A 0-width image makes `orig_w as usize - 1` underflow (debug panic / release
+        // wrap to usize::MAX -> corrupted bilinear indices). Must return Err.
+        let image = ImageData::new(Vec::new(), 0, 4, 1);
+        let res = Preprocessor::new(8, 8).letterbox(&image);
+        assert!(res.is_err(), "zero-width image must return Err, not panic");
+    }
+
+    #[test]
+    fn test_letterbox_zero_height_returns_err() {
+        let image = ImageData::new(Vec::new(), 4, 0, 1);
+        let res = Preprocessor::new(8, 8).letterbox(&image);
+        assert!(res.is_err(), "zero-height image must return Err, not panic");
+    }
+
+    #[test]
+    fn test_preprocess_zero_dim_returns_err() {
+        // The full preprocess path must also reject zero dimensions.
+        let image = ImageData::from_rgb(Vec::new(), 0, 0);
+        let res = Preprocessor::new(8, 8).preprocess(&image);
+        assert!(res.is_err(), "zero-dim image must return Err, not panic");
+    }
 
     #[test]
     fn test_nms_handles_nan_confidence_without_panic() {
