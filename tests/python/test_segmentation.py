@@ -1,5 +1,7 @@
 """Instance-segmentation Python bindings tests (sub-project 9c)."""
 
+import os
+
 import numpy as np
 import pytest
 
@@ -82,3 +84,49 @@ def test_predict_instances_returns_image_space_masks():
     # first vertex must be offset into image coordinates (x >= 100).
     first_xs = [r.mask[0][0] for r in results if r.mask is not None]
     assert any(x >= 100.0 for x in first_xs)
+
+
+def test_yolov8_seg_detector_construction_and_attrs():
+    from sahi_rs import YOLOv8SegDetector
+
+    det = YOLOv8SegDetector(
+        "nonexistent.onnx", num_classes=80, num_masks=32, input_size=640
+    )
+    assert det.is_loaded() is False
+    assert det.num_classes == 80
+    assert det.num_masks == 32
+    assert det.input_size == 640
+    assert "YOLOv8SegDetector" in repr(det)
+
+
+def test_yolov8_seg_detector_load_missing_model_errors():
+    from sahi_rs import YOLOv8SegDetector
+
+    det = YOLOv8SegDetector("definitely_missing_model.onnx")
+    with pytest.raises(RuntimeError):
+        det.load()
+
+
+def test_predict_instances_yolov8_requires_loaded_model():
+    from sahi_rs import Sahi, YOLOv8SegDetector
+
+    sahi = Sahi(slice_width=64, slice_height=64)
+    det = YOLOv8SegDetector("nonexistent.onnx")
+    img = np.zeros((64, 64, 3), dtype=np.uint8)
+    with pytest.raises(RuntimeError):
+        sahi.predict_instances_yolov8(img, det)
+
+
+@pytest.mark.skipif(
+    "SAHI_TEST_YOLOV8_SEG_MODEL" not in os.environ,
+    reason="requires a real YOLOv8-seg ONNX model",
+)
+def test_predict_instances_yolov8_real_model():
+    from sahi_rs import Sahi, YOLOv8SegDetector
+
+    det = YOLOv8SegDetector(os.environ["SAHI_TEST_YOLOV8_SEG_MODEL"])
+    det.load()
+    sahi = Sahi(slice_width=640, slice_height=640)
+    img = np.zeros((640, 640, 3), dtype=np.uint8)
+    out = sahi.predict_instances_yolov8(img, det)
+    assert isinstance(out, list)

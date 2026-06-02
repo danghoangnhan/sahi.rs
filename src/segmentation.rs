@@ -315,6 +315,17 @@ pub(crate) mod python {
         polygons: Option<Vec<Vec<f32>>>,
     }
 
+    impl PyMaskedDetection {
+        /// Build a wrapper from a Rust [`MaskedDetection`]; polygons are stored in
+        /// COCO format (`None` when the detection carries no mask).
+        pub(crate) fn from_masked(md: MaskedDetection) -> Self {
+            Self {
+                detection: md.detection,
+                polygons: md.mask.map(|m| m.to_coco_segmentation()),
+            }
+        }
+    }
+
     #[pymethods]
     impl PyMaskedDetection {
         #[new]
@@ -423,10 +434,7 @@ pub(crate) mod python {
 
         Ok(results
             .into_iter()
-            .map(|md| PyMaskedDetection {
-                detection: md.detection,
-                polygons: md.mask.map(|m| m.to_coco_segmentation()),
-            })
+            .map(PyMaskedDetection::from_masked)
             .collect())
     }
 }
