@@ -58,7 +58,7 @@ mod python {
     use crate::model::DetectionModel;
     use crate::onnx::session::ExecutionProvider;
 
-    use super::{YOLOv8Config, YOLOv8Detector};
+    use super::{YOLOv8Config, YOLOv8Detector, YOLOv8SegConfig, YOLOv8SegDetector};
 
     /// Python wrapper for YOLOv8Detector.
     #[pyclass(name = "YOLOv8Detector")]
@@ -197,6 +197,129 @@ mod python {
         }
     }
 
+    /// Python wrapper for the built-in YOLOv8-seg segmenter.
+    #[pyclass(name = "YOLOv8SegDetector")]
+    pub struct PyYOLOv8SegDetector {
+        inner: YOLOv8SegDetector,
+    }
+
+    #[pymethods]
+    impl PyYOLOv8SegDetector {
+        /// Create a new YOLOv8-seg segmenter.
+        ///
+        /// Args:
+        ///     model_path: Path to the ONNX model file
+        ///     num_classes: Number of classes (default: 80 for COCO)
+        ///     num_masks: Number of mask prototypes/coefficients (default: 32)
+        ///     input_size: Model input size (default: 640)
+        ///     confidence_threshold: Minimum confidence (default: 0.25)
+        ///     iou_threshold: NMS IoU threshold (default: 0.45)
+        ///     mask_threshold: Mask binarization threshold (default: 0.5)
+        ///     device: Device to use - "cpu", "cuda", or "cuda:N" (default: "cpu")
+        #[new]
+        #[pyo3(signature = (
+            model_path,
+            num_classes=80,
+            num_masks=32,
+            input_size=640,
+            confidence_threshold=0.25,
+            iou_threshold=0.45,
+            mask_threshold=0.5,
+            device="cpu"
+        ))]
+        #[allow(clippy::too_many_arguments)]
+        fn new(
+            model_path: &str,
+            num_classes: u32,
+            num_masks: u32,
+            input_size: u32,
+            confidence_threshold: f32,
+            iou_threshold: f32,
+            mask_threshold: f32,
+            device: &str,
+        ) -> PyResult<Self> {
+            let ep = parse_device(device)?;
+
+            let config = YOLOv8SegConfig::new(model_path)
+                .with_num_classes(num_classes)
+                .with_num_masks(num_masks)
+                .with_input_size(input_size)
+                .with_confidence_threshold(confidence_threshold)
+                .with_iou_threshold(iou_threshold)
+                .with_mask_threshold(mask_threshold)
+                .with_execution_provider(ep);
+
+            Ok(Self {
+                inner: YOLOv8SegDetector::from_config(config),
+            })
+        }
+
+        /// Load the model.
+        fn load(&mut self) -> PyResult<()> {
+            self.inner
+                .load()
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        }
+
+        /// Unload the model.
+        fn unload(&mut self) {
+            self.inner.unload();
+        }
+
+        /// Check if the model is loaded.
+        fn is_loaded(&self) -> bool {
+            self.inner.is_loaded()
+        }
+
+        #[getter]
+        fn num_classes(&self) -> u32 {
+            self.inner.config().num_classes
+        }
+
+        #[getter]
+        fn num_masks(&self) -> u32 {
+            self.inner.config().num_masks
+        }
+
+        #[getter]
+        fn input_size(&self) -> u32 {
+            self.inner.config().input_size
+        }
+
+        #[getter]
+        fn confidence_threshold(&self) -> f32 {
+            self.inner.config().confidence_threshold
+        }
+
+        #[getter]
+        fn iou_threshold(&self) -> f32 {
+            self.inner.config().iou_threshold
+        }
+
+        #[getter]
+        fn mask_threshold(&self) -> f32 {
+            self.inner.config().mask_threshold
+        }
+
+        fn __repr__(&self) -> String {
+            format!(
+                "YOLOv8SegDetector(model='{}', num_classes={}, num_masks={}, input_size={}, loaded={})",
+                self.inner.config().model_path.display(),
+                self.inner.config().num_classes,
+                self.inner.config().num_masks,
+                self.inner.config().input_size,
+                self.inner.is_loaded()
+            )
+        }
+    }
+
+    impl PyYOLOv8SegDetector {
+        /// Borrow the inner segmenter (used by `Sahi.predict_instances_yolov8`).
+        pub(crate) fn inner(&self) -> &YOLOv8SegDetector {
+            &self.inner
+        }
+    }
+
     /// Parse device string to ExecutionProvider.
     fn parse_device(device: &str) -> PyResult<ExecutionProvider> {
         let device = device.to_lowercase();
@@ -229,4 +352,4 @@ mod python {
 }
 
 #[cfg(feature = "python")]
-pub use python::PyYOLOv8Detector;
+pub use python::{PyYOLOv8Detector, PyYOLOv8SegDetector};

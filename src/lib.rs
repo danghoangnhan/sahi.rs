@@ -558,6 +558,42 @@ mod python {
             crate::segmentation::python::run_predict_instances(&self.inner, image, callback)
         }
 
+        /// Run sliced instance segmentation with the built-in YOLOv8-seg model.
+        ///
+        /// Args:
+        ///     image: numpy array (H, W, C) uint8 RGB
+        ///     detector: a loaded `YOLOv8SegDetector`
+        ///
+        /// Returns:
+        ///     List of MaskedDetection objects with coordinates in original image space.
+        #[cfg(feature = "onnx")]
+        fn predict_instances_yolov8(
+            &self,
+            _py: Python<'_>,
+            image: &Bound<'_, PyArray3<u8>>,
+            detector: PyRef<'_, onnx::PyYOLOv8SegDetector>,
+        ) -> PyResult<Vec<crate::segmentation::PyMaskedDetection>> {
+            let shape = image.shape();
+            let height = shape[0] as u32;
+            let width = shape[1] as u32;
+            let channels = shape[2] as u32;
+
+            // Safety: only read within this scope.
+            let array = unsafe { image.as_array() };
+            let data: Vec<u8> = array.iter().copied().collect();
+            let image_data = ImageData::new(data, width, height, channels);
+
+            let results = self
+                .inner
+                .predict_instances(&image_data, detector.inner())
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+            Ok(results
+                .into_iter()
+                .map(crate::segmentation::PyMaskedDetection::from_masked)
+                .collect())
+        }
+
         /// Get the backend name.
         fn backend_name(&self) -> &'static str {
             self.inner.backend_name()
@@ -650,6 +686,8 @@ mod python {
         // ONNX types (feature-gated)
         #[cfg(feature = "onnx")]
         m.add_class::<onnx::PyYOLOv8Detector>()?;
+        #[cfg(feature = "onnx")]
+        m.add_class::<onnx::PyYOLOv8SegDetector>()?;
 
         Ok(())
     }
