@@ -258,16 +258,33 @@ fn merge_group(items: &[MaskedDetection], group: &[usize]) -> MaskedDetection {
     MaskedDetection::new(detection, union_masks(&masks))
 }
 
-/// Union several masks into one by concatenating their polygon sets, keeping the
-/// first mask's `full_shape`. Returns `None` when no masks are given.
+/// Union several masks into one by rasterizing each into a shared bitmap (OR),
+/// then re-tracing a single clean polygon set with the contour tracer. Counting
+/// overlap once keeps `Mask::area` accurate and bounds the polygon count, unlike
+/// concatenating polygon sets (which double-counts overlap and grows unbounded
+/// across merges). Members are rasterized at the first mask's `full_shape`, which
+/// the result also adopts. Returns `None` when no masks are given.
 fn union_masks(masks: &[Mask]) -> Option<Mask> {
     let first = masks.first()?;
     let shape = first.full_shape();
-    let polygons: Vec<Vec<f32>> = masks
-        .iter()
-        .flat_map(|m| m.to_coco_segmentation())
-        .collect();
-    Some(Mask::new(polygons, shape, None))
+    let (w, h) = (shape.width as usize, shape.height as usize);
+
+    let mut acc = vec![false; w * h];
+    for m in masks {
+        // Rasterize this member's polygons at the shared `shape`, then OR it in.
+        let bm = Mask::new(m.to_coco_segmentation(), shape, None).to_bool_mask();
+        for (slot, &on) in acc.iter_mut().zip(bm.iter()) {
+            *slot |= on;
+        }
+    }
+
+    Some(Mask::from_bool_mask(
+        &acc,
+        shape.width,
+        shape.height,
+        shape,
+        None,
+    ))
 }
 
 // ============================================================================
@@ -566,7 +583,9 @@ mod tests {
     }
 
     #[test]
-    fn test_union_masks_concatenates_and_preserves_shape() {
+    fn test_union_masks_keeps_disjoint_regions_separate() {
+        // Two non-overlapping squares remain two separate components after the
+        // rasterize/OR/re-trace union; the first mask's shape is preserved.
         let m1 = Mask::new(
             vec![vec![0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0]],
             [50u32, 50u32],
@@ -581,6 +600,56 @@ mod tests {
         assert_eq!(u.segmentation().len(), 2);
         assert_eq!(u.full_shape(), FullShape::new(50, 50));
         assert!(union_masks(&[]).is_none());
+    }
+
+    #[test]
+    fn test_union_masks_dedups_overlapping_into_single_polygon() {
+        // Two overlapping 50x50 squares on a 100x100 canvas form one connected region.
+        let a = Mask::new(
+            vec![vec![10.0, 10.0, 60.0, 10.0, 60.0, 60.0, 10.0, 60.0]],
+            [100u32, 100u32],
+            None,
+        );
+        let b = Mask::new(
+            vec![vec![40.0, 40.0, 90.0, 40.0, 90.0, 90.0, 40.0, 90.0]],
+            [100u32, 100u32],
+            None,
+        );
+        let u = union_masks(&[a, b]).unwrap();
+        assert_eq!(
+            u.segmentation().len(),
+            1,
+            "overlapping masks should re-trace into a single polygon"
+        );
+    }
+
+    #[test]
+    fn test_union_masks_overlapping_area_is_union_not_sum() {
+        let a = Mask::new(
+            vec![vec![10.0, 10.0, 60.0, 10.0, 60.0, 60.0, 10.0, 60.0]],
+            [100u32, 100u32],
+            None,
+        );
+        let b = Mask::new(
+            vec![vec![40.0, 40.0, 90.0, 40.0, 90.0, 90.0, 40.0, 90.0]],
+            [100u32, 100u32],
+            None,
+        );
+        // 50x50 + 50x50 polygons overlapping in a 20x20 corner; the overlap must
+        // not be double-counted, so the union area is well below their sum.
+        let summed = a.area() + b.area();
+        let u = union_masks(&[a, b]).unwrap();
+        assert!(
+            u.area() < summed - 100.0,
+            "union area {} should be well below the summed area {} (overlap double-counted)",
+            u.area(),
+            summed
+        );
+        assert!(
+            u.area() > 4000.0,
+            "union area {} should still cover the merged region",
+            u.area()
+        );
     }
 
     #[test]
