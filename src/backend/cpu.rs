@@ -109,6 +109,26 @@ impl Backend for CpuBackend {
         }
     }
 
+    fn extract_slices(&self, image: &ImageData, slices: &[Slice]) -> Result<Vec<ImageData>> {
+        #[cfg(feature = "parallel")]
+        {
+            Ok(self.thread_pool.install(|| {
+                slices
+                    .par_iter()
+                    .map(|s| image.extract_slice(s.x, s.y, s.width, s.height))
+                    .collect()
+            }))
+        }
+
+        #[cfg(not(feature = "parallel"))]
+        {
+            Ok(slices
+                .iter()
+                .map(|s| image.extract_slice(s.x, s.y, s.width, s.height))
+                .collect())
+        }
+    }
+
     fn name(&self) -> &'static str {
         "cpu"
     }
@@ -127,10 +147,7 @@ impl CpuBackend {
         slices: &[Slice],
         callback: &dyn InferenceCallback,
     ) -> Result<Vec<(Slice, Vec<Detection>)>> {
-        let slice_images: Vec<ImageData> = slices
-            .iter()
-            .map(|s| image.extract_slice(s.x, s.y, s.width, s.height))
-            .collect();
+        let slice_images = self.extract_slices(image, slices)?;
 
         let detections = callback.infer_batch(&slice_images)?;
         Ok(slices.iter().copied().zip(detections).collect())
@@ -144,13 +161,8 @@ impl CpuBackend {
         slices: &[Slice],
         callback: &dyn InferenceCallback,
     ) -> Result<Vec<(Slice, Vec<Detection>)>> {
-        // Parallel slice extraction
-        let slice_images: Vec<ImageData> = self.thread_pool.install(|| {
-            slices
-                .par_iter()
-                .map(|s| image.extract_slice(s.x, s.y, s.width, s.height))
-                .collect()
-        });
+        // Parallel slice extraction (shared with the segmentation path).
+        let slice_images = self.extract_slices(image, slices)?;
 
         if self.config.parallel_inference {
             // Parallel inference (opt-in, NOT safe for Python/GIL callbacks)
@@ -207,6 +219,24 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].1.len(), 1);
         assert_eq!(result[1].1.len(), 1);
+    }
+
+    #[test]
+    fn test_extract_slices_matches_direct_extraction() {
+        let backend = CpuBackend::new();
+        let image = ImageData::from_rgb((0..300).map(|i| (i % 256) as u8).collect(), 10, 10);
+        let slices = vec![
+            Slice::new(0, 0, 5, 5, 0),
+            Slice::new(5, 5, 5, 5, 1),
+            Slice::new(2, 3, 4, 4, 2),
+        ];
+        let got = backend.extract_slices(&image, &slices).unwrap();
+        assert_eq!(got.len(), slices.len());
+        for (s, img) in slices.iter().zip(&got) {
+            let expected = image.extract_slice(s.x, s.y, s.width, s.height);
+            assert_eq!(img.data, expected.data);
+            assert_eq!((img.width, img.height), (s.width, s.height));
+        }
     }
 
     #[test]

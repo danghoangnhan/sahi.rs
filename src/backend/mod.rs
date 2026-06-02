@@ -28,6 +28,18 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
         callback: &dyn InferenceCallback,
     ) -> Result<Vec<(Slice, Vec<Detection>)>>;
 
+    /// Extract every slice image from `image`, in the same order as `slices`.
+    ///
+    /// Backends may parallelize (CPU rayon) or accelerate (CUDA) extraction; the
+    /// default is sequential. Both the detection and segmentation pipelines build
+    /// on this so masks get the same acceleration as boxes.
+    fn extract_slices(&self, image: &ImageData, slices: &[Slice]) -> Result<Vec<ImageData>> {
+        Ok(slices
+            .iter()
+            .map(|s| image.extract_slice(s.x, s.y, s.width, s.height))
+            .collect())
+    }
+
     /// Get the backend name.
     fn name(&self) -> &'static str;
 

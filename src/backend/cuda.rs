@@ -479,6 +479,31 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn extract_slices(&self, image: &ImageData, slices: &[Slice]) -> Result<Vec<ImageData>> {
+        if !self.is_available() {
+            return Err(Error::gpu("CUDA device not available"));
+        }
+
+        if self.kernel_loaded {
+            // GPU extraction via the same stream-concurrent path as detection.
+            let gpu_image = self.upload_image(image)?;
+            let streams = self.create_streams()?;
+            let mut out = Vec::with_capacity(slices.len());
+            for chunk in slices.chunks(self.config.max_batch_size) {
+                let gpu_slices =
+                    self.extract_chunk_on_streams(&gpu_image, image, chunk, &streams)?;
+                self.sync_streams(&streams)?;
+                out.extend(self.download_chunk(&gpu_slices, chunk, image.channels)?);
+            }
+            Ok(out)
+        } else {
+            Ok(slices
+                .iter()
+                .map(|s| image.extract_slice(s.x, s.y, s.width, s.height))
+                .collect())
+        }
+    }
+
     fn name(&self) -> &'static str {
         "cuda"
     }

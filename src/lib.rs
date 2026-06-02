@@ -144,11 +144,17 @@ impl Sahi {
         callback: &dyn SegmentationCallback,
     ) -> Result<Vec<MaskedDetection>> {
         let slices = self.slicer.slice(image.width, image.height);
-        let mut all: Vec<MaskedDetection> = Vec::new();
 
-        for slice in &slices {
-            let slice_img = image.extract_slice(slice.x, slice.y, slice.width, slice.height);
-            for mut pred in callback.infer(&slice_img)? {
+        // Extract slices through the backend (CPU rayon / CUDA), then run one
+        // batched inference, so the mask pipeline gets the same acceleration as
+        // detection. `infer_batch` defaults to sequential per-slice inference,
+        // which stays GIL-safe for Python callbacks.
+        let slice_images = self.backend.extract_slices(image, &slices)?;
+        let per_slice = callback.infer_batch(&slice_images)?;
+
+        let mut all: Vec<MaskedDetection> = Vec::new();
+        for (slice, preds) in slices.iter().zip(per_slice) {
+            for mut pred in preds {
                 pred.detection = pred.detection.translate(slice.x as f32, slice.y as f32);
                 if let Some(m) = pred.mask.take() {
                     pred.mask = Some(segmentation::rebase_mask(
