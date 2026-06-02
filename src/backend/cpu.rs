@@ -31,7 +31,7 @@ pub struct CpuBackendConfig {
 pub struct CpuBackend {
     config: CpuBackendConfig,
     #[cfg(feature = "parallel")]
-    thread_pool: rayon::ThreadPool,
+    thread_pool: Option<rayon::ThreadPool>,
 }
 
 impl CpuBackend {
@@ -75,13 +75,25 @@ impl CpuBackend {
         &self.config
     }
 
+    /// Build the configured rayon pool, falling back to `None` (rayon's global
+    /// pool) if it cannot be constructed — rather than panicking.
     #[cfg(feature = "parallel")]
-    fn build_thread_pool(num_threads: usize) -> rayon::ThreadPool {
+    fn build_thread_pool(num_threads: usize) -> Option<rayon::ThreadPool> {
         let mut builder = rayon::ThreadPoolBuilder::new();
         if num_threads > 0 {
             builder = builder.num_threads(num_threads);
         }
-        builder.build().expect("Failed to build rayon thread pool")
+        builder.build().ok()
+    }
+
+    /// Run `op` on the configured pool, or on rayon's global pool when no custom
+    /// pool is available.
+    #[cfg(feature = "parallel")]
+    fn install<R: Send>(&self, op: impl FnOnce() -> R + Send) -> R {
+        match &self.thread_pool {
+            Some(pool) => pool.install(op),
+            None => op(),
+        }
     }
 }
 
@@ -112,7 +124,7 @@ impl Backend for CpuBackend {
     fn extract_slices(&self, image: &ImageData, slices: &[Slice]) -> Result<Vec<ImageData>> {
         #[cfg(feature = "parallel")]
         {
-            Ok(self.thread_pool.install(|| {
+            Ok(self.install(|| {
                 slices
                     .par_iter()
                     .map(|s| image.extract_slice(s.x, s.y, s.width, s.height))
@@ -166,7 +178,7 @@ impl CpuBackend {
 
         if self.config.parallel_inference {
             // Parallel inference (opt-in, NOT safe for Python/GIL callbacks)
-            let results: Result<Vec<(Slice, Vec<Detection>)>> = self.thread_pool.install(|| {
+            let results: Result<Vec<(Slice, Vec<Detection>)>> = self.install(|| {
                 slices
                     .par_iter()
                     .zip(slice_images.par_iter())
@@ -236,6 +248,25 @@ mod tests {
             let expected = image.extract_slice(s.x, s.y, s.width, s.height);
             assert_eq!(img.data, expected.data);
             assert_eq!((img.width, img.height), (s.width, s.height));
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn test_extract_slices_falls_back_to_global_pool() {
+        // A `None` custom pool (e.g. if building one failed) must not panic;
+        // extraction falls back to rayon's global pool and stays correct.
+        let mut backend = CpuBackend::new();
+        backend.thread_pool = None;
+        let image = ImageData::from_rgb((0..300).map(|i| (i % 256) as u8).collect(), 10, 10);
+        let slices = vec![Slice::new(0, 0, 5, 5, 0), Slice::new(5, 5, 5, 5, 1)];
+        let got = backend.extract_slices(&image, &slices).unwrap();
+        assert_eq!(got.len(), 2);
+        for (s, img) in slices.iter().zip(&got) {
+            assert_eq!(
+                img.data,
+                image.extract_slice(s.x, s.y, s.width, s.height).data
+            );
         }
     }
 

@@ -204,10 +204,10 @@ impl YOLOv8Processor {
         let (class_id, confidence) = class_scores
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())?;
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))?;
 
-        // Apply confidence threshold
-        if *confidence < self.confidence_threshold {
+        // Drop non-finite (NaN/inf) scores, then apply the confidence threshold.
+        if !confidence.is_finite() || *confidence < self.confidence_threshold {
             return None;
         }
 
@@ -329,6 +329,41 @@ impl YOLOv8Processor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_process_output_drops_nan_score_without_panic() {
+        let processor = YOLOv8Processor::new(64, 2).with_confidence_threshold(0.1);
+        let info = crate::onnx::processor::LetterboxInfo {
+            orig_width: 100,
+            orig_height: 100,
+            target_width: 64,
+            target_height: 64,
+            pad_left: 0,
+            pad_top: 0,
+            scale: 1.0,
+        };
+        // box0 has a NaN class score (must be dropped, not panic); box1 is finite.
+        // Standard layout (1, box_dim=6, num_boxes=2): row-major over (6, 2).
+        let data = vec![
+            50.0,
+            30.0, // x_center for box0, box1
+            50.0,
+            30.0, // y_center
+            20.0,
+            10.0, // w
+            20.0,
+            10.0, // h
+            0.1,
+            0.9, // class0 score
+            f32::NAN,
+            0.1, // class1 score: NaN for box0, finite for box1
+        ];
+        let out = processor
+            .process_output(&data, &[1, 6, 2], &info)
+            .expect("must not panic on NaN");
+        assert_eq!(out.len(), 1, "the NaN-confidence box must be dropped");
+        assert!(out[0].confidence.is_finite());
+    }
 
     #[test]
     fn test_detect_output_format() {
