@@ -223,60 +223,70 @@ impl Postprocessor {
 
     /// Apply Non-Maximum Merging to a list of detections.
     ///
-    /// Merges all overlapping boxes into a single box with averaged confidence.
+    /// Transitive: boxes are linked when their match score exceeds the threshold, and each
+    /// connected component of that match graph is merged into one detection (so A–B + B–C
+    /// merges {A, B, C} even when A and C do not overlap). Matches reference SAHI's NMM —
+    /// looser than [`greedy_nmm`](Self::greedy_nmm), which only merges direct overlaps.
     pub fn nmm(&self, detections: &mut [Detection]) -> Vec<Detection> {
         if detections.is_empty() {
             return Vec::new();
         }
 
-        // Sort by confidence (descending)
+        // Sort by confidence (descending), so the lowest index in each component is its anchor.
         detections.sort_by(|a, b| {
             b.confidence
                 .partial_cmp(&a.confidence)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let mut merged: Vec<Detection> = Vec::new();
-        let mut used = vec![false; detections.len()];
-
-        for i in 0..detections.len() {
-            if used[i] {
-                continue;
-            }
-
-            // Find all boxes that match with this one
-            let mut group_indices = vec![i];
-            for j in (i + 1)..detections.len() {
-                if used[j] {
-                    continue;
-                }
-
+        // Union-find over the match graph.
+        let n = detections.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+        for i in 0..n {
+            for j in (i + 1)..n {
                 if !self.should_compare(&detections[i], &detections[j]) {
                     continue;
                 }
-
-                let score = self.match_score(&detections[i].bbox, &detections[j].bbox);
-                if score > self.config.match_threshold {
-                    group_indices.push(j);
+                if self.match_score(&detections[i].bbox, &detections[j].bbox)
+                    > self.config.match_threshold
+                {
+                    let (ri, rj) = (uf_find(&mut parent, i), uf_find(&mut parent, j));
+                    if ri != rj {
+                        parent[ri] = rj;
+                    }
                 }
-            }
-
-            // Merge the group
-            let merged_det = self.merge_detection_group(detections, &group_indices);
-            merged.push(merged_det);
-
-            for &idx in &group_indices {
-                used[idx] = true;
             }
         }
 
-        merged
+        // Gather connected components, preserving descending-confidence order.
+        let mut group_of: Vec<Option<usize>> = vec![None; n];
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for i in 0..n {
+            let root = uf_find(&mut parent, i);
+            let gi = match group_of[root] {
+                Some(g) => g,
+                None => {
+                    let g = groups.len();
+                    group_of[root] = Some(g);
+                    groups.push(Vec::new());
+                    g
+                }
+            };
+            groups[gi].push(i);
+        }
+
+        groups
+            .iter()
+            .map(|indices| self.merge_detection_group(detections, indices))
+            .collect()
     }
 
     /// Apply Greedy Non-Maximum Merging to a list of detections.
     ///
-    /// Similar to NMM but merges greedily (each box is merged into at most one group).
-    /// This is the default algorithm used in the original SAHI.
+    /// Walks detections in descending confidence; each unused anchor claims a group of every
+    /// still-unused box that directly overlaps the **fixed anchor** (no transitive merging, no
+    /// box growth), then merges the group. Matches reference SAHI's GreedyNMM — tighter than
+    /// [`nmm`](Self::nmm), which merges transitively.
     pub fn greedy_nmm(&self, detections: &mut [Detection]) -> Vec<Detection> {
         if detections.is_empty() {
             return Vec::new();
@@ -298,28 +308,25 @@ impl Postprocessor {
             }
             used[i] = true;
 
-            let mut current = detections[i].clone();
-
-            // Greedily merge overlapping boxes
+            // Group every still-unused box that directly overlaps the fixed anchor `i`.
+            let mut group_indices = vec![i];
             for j in (i + 1)..detections.len() {
                 if used[j] {
                     continue;
                 }
 
-                if !self.should_compare(&current, &detections[j]) {
+                if !self.should_compare(&detections[i], &detections[j]) {
                     continue;
                 }
 
-                let score = self.match_score(&current.bbox, &detections[j].bbox);
+                let score = self.match_score(&detections[i].bbox, &detections[j].bbox);
                 if score > self.config.match_threshold {
-                    // Merge boxes (union). Confidence stays at the group max: detections are
-                    // sorted by descending confidence, so `current` already holds the highest.
-                    current.bbox = merge_boxes(&current.bbox, &detections[j].bbox);
+                    group_indices.push(j);
                     used[j] = true;
                 }
             }
 
-            result.push(current);
+            result.push(self.merge_detection_group(detections, &group_indices));
         }
 
         result
@@ -352,6 +359,21 @@ impl Postprocessor {
     pub fn config(&self) -> &PostprocessConfig {
         &self.config
     }
+}
+
+/// Union-find `find` with path compression (used by transitive NMM).
+fn uf_find(parent: &mut [usize], x: usize) -> usize {
+    let mut root = x;
+    while parent[root] != root {
+        root = parent[root];
+    }
+    let mut cur = x;
+    while parent[cur] != root {
+        let next = parent[cur];
+        parent[cur] = root;
+        cur = next;
+    }
+    root
 }
 
 #[cfg(test)]
@@ -474,6 +496,42 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         // Merged confidence is the max of the group, not the average
+        assert!((result[0].confidence - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_greedy_nmm_chain_keeps_indirect_box_separate() {
+        // A-B overlap (~0.67) and B-C overlap (~0.67), but A-C do not (~0.43).
+        // GREEDYNMM matches only the fixed anchor, so C is not pulled into A's group.
+        let postprocessor = Postprocessor::new(
+            PostprocessConfig::new(0.5, 0.0).with_postprocess_type(PostprocessType::GREEDYNMM),
+        );
+        let mut detections = vec![
+            Detection::new(BoundingBox::new(0.0, 0.0, 100.0, 100.0), 0, 0.9, None),
+            Detection::new(BoundingBox::new(20.0, 0.0, 100.0, 100.0), 0, 0.8, None),
+            Detection::new(BoundingBox::new(40.0, 0.0, 100.0, 100.0), 0, 0.7, None),
+        ];
+        let result = postprocessor.greedy_nmm(&mut detections);
+        assert_eq!(
+            result.len(),
+            2,
+            "C overlaps the A+B union but not A directly; GREEDYNMM must keep it separate"
+        );
+    }
+
+    #[test]
+    fn test_nmm_chain_merges_transitively() {
+        // Same chain; NMM is transitive (A-B, B-C) so all three merge into one.
+        let postprocessor = Postprocessor::new(
+            PostprocessConfig::new(0.5, 0.0).with_postprocess_type(PostprocessType::NMM),
+        );
+        let mut detections = vec![
+            Detection::new(BoundingBox::new(0.0, 0.0, 100.0, 100.0), 0, 0.9, None),
+            Detection::new(BoundingBox::new(20.0, 0.0, 100.0, 100.0), 0, 0.8, None),
+            Detection::new(BoundingBox::new(40.0, 0.0, 100.0, 100.0), 0, 0.7, None),
+        ];
+        let result = postprocessor.nmm(&mut detections);
+        assert_eq!(result.len(), 1, "transitive NMM merges the whole chain");
         assert!((result[0].confidence - 0.9).abs() < 1e-6);
     }
 

@@ -174,9 +174,55 @@ fn seg_nms(items: Vec<MaskedDetection>, config: &PostprocessConfig) -> Vec<Maske
         .collect()
 }
 
-/// NMM: group each anchor's matches (compared against the anchor) and merge each
-/// group into one detection (unioned bbox, anchor's max confidence, unioned mask).
+/// NMM: transitive merging. Boxes are linked when their match score exceeds the
+/// threshold, and each connected component of the match graph is merged into one
+/// detection (unioned bbox, anchor's max confidence, unioned masks) — so A–B + B–C
+/// merges {A, B, C} even when A and C do not overlap.
 fn seg_nmm(items: Vec<MaskedDetection>, config: &PostprocessConfig) -> Vec<MaskedDetection> {
+    let n = items.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if config.class_aware && items[i].detection.class_id != items[j].detection.class_id {
+                continue;
+            }
+            let score = match_score(
+                &items[i].detection.bbox,
+                &items[j].detection.bbox,
+                config.match_metric,
+            );
+            if score > config.match_threshold {
+                let (ri, rj) = (uf_find(&mut parent, i), uf_find(&mut parent, j));
+                if ri != rj {
+                    parent[ri] = rj;
+                }
+            }
+        }
+    }
+
+    // Gather connected components, preserving descending-confidence order.
+    let mut group_of: Vec<Option<usize>> = vec![None; n];
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for i in 0..n {
+        let root = uf_find(&mut parent, i);
+        let gi = match group_of[root] {
+            Some(g) => g,
+            None => {
+                let g = groups.len();
+                group_of[root] = Some(g);
+                groups.push(Vec::new());
+                g
+            }
+        };
+        groups[gi].push(i);
+    }
+    groups.iter().map(|g| merge_group(&items, g)).collect()
+}
+
+/// GREEDYNMM: each unused anchor (in descending confidence) claims every still-unused
+/// box that directly overlaps the **fixed anchor** (no transitive merging, no box
+/// growth), then merges the group. Tighter than [`seg_nmm`].
+fn seg_greedy_nmm(items: Vec<MaskedDetection>, config: &PostprocessConfig) -> Vec<MaskedDetection> {
     let n = items.len();
     let mut used = vec![false; n];
     let mut result = Vec::new();
@@ -184,6 +230,7 @@ fn seg_nmm(items: Vec<MaskedDetection>, config: &PostprocessConfig) -> Vec<Maske
         if used[i] {
             continue;
         }
+        used[i] = true;
         let mut group = vec![i];
         for j in (i + 1)..n {
             if used[j] {
@@ -198,39 +245,6 @@ fn seg_nmm(items: Vec<MaskedDetection>, config: &PostprocessConfig) -> Vec<Maske
                 config.match_metric,
             );
             if score > config.match_threshold {
-                group.push(j);
-            }
-        }
-        for &k in &group {
-            used[k] = true;
-        }
-        result.push(merge_group(&items, &group));
-    }
-    result
-}
-
-/// GREEDYNMM: like NMM, but the comparison box grows as it absorbs matches.
-fn seg_greedy_nmm(items: Vec<MaskedDetection>, config: &PostprocessConfig) -> Vec<MaskedDetection> {
-    let n = items.len();
-    let mut used = vec![false; n];
-    let mut result = Vec::new();
-    for i in 0..n {
-        if used[i] {
-            continue;
-        }
-        used[i] = true;
-        let mut group = vec![i];
-        let mut bbox = items[i].detection.bbox;
-        for j in (i + 1)..n {
-            if used[j] {
-                continue;
-            }
-            if config.class_aware && items[i].detection.class_id != items[j].detection.class_id {
-                continue;
-            }
-            let score = match_score(&bbox, &items[j].detection.bbox, config.match_metric);
-            if score > config.match_threshold {
-                bbox = bbox.union_box(&items[j].detection.bbox);
                 used[j] = true;
                 group.push(j);
             }
@@ -238,6 +252,21 @@ fn seg_greedy_nmm(items: Vec<MaskedDetection>, config: &PostprocessConfig) -> Ve
         result.push(merge_group(&items, &group));
     }
     result
+}
+
+/// Union-find `find` with path compression (used by transitive [`seg_nmm`]).
+fn uf_find(parent: &mut [usize], x: usize) -> usize {
+    let mut root = x;
+    while parent[root] != root {
+        root = parent[root];
+    }
+    let mut cur = x;
+    while parent[cur] != root {
+        let next = parent[cur];
+        parent[cur] = root;
+        cur = next;
+    }
+    root
 }
 
 /// Merge a group of detections (the first is the highest-confidence anchor) into
@@ -737,38 +766,45 @@ mod tests {
         assert!(in_mask(mask, 75, 75)); // B's region -> proves the union
     }
 
+    // Chain A(0..100) - B(20..120) - C(40..140): A-B and B-C overlap (~0.67),
+    // A-C do not (~0.43). Used by both the NMM (transitive) and GREEDYNMM tests.
+    fn chain_abc() -> Vec<MaskedDetection> {
+        vec![
+            masked_poly(
+                0.0,
+                0.0,
+                100.0,
+                100.0,
+                0.9,
+                0,
+                vec![5.0, 5.0, 15.0, 5.0, 15.0, 15.0, 5.0, 15.0],
+            ),
+            masked_poly(
+                20.0,
+                0.0,
+                100.0,
+                100.0,
+                0.8,
+                0,
+                vec![60.0, 5.0, 70.0, 5.0, 70.0, 15.0, 60.0, 15.0],
+            ),
+            masked_poly(
+                40.0,
+                0.0,
+                100.0,
+                100.0,
+                0.7,
+                0,
+                vec![125.0, 5.0, 135.0, 5.0, 135.0, 15.0, 125.0, 15.0],
+            ),
+        ]
+    }
+
     #[test]
-    fn test_greedy_nmm_chain_merges_to_one() {
-        let cfg =
-            PostprocessConfig::new(0.5, 0.0).with_postprocess_type(PostprocessType::GREEDYNMM);
-        let a = masked_poly(
-            0.0,
-            0.0,
-            100.0,
-            100.0,
-            0.9,
-            0,
-            vec![5.0, 5.0, 15.0, 5.0, 15.0, 15.0, 5.0, 15.0],
-        );
-        let b = masked_poly(
-            20.0,
-            0.0,
-            100.0,
-            100.0,
-            0.8,
-            0,
-            vec![60.0, 5.0, 70.0, 5.0, 70.0, 15.0, 60.0, 15.0],
-        );
-        let c = masked_poly(
-            40.0,
-            0.0,
-            100.0,
-            100.0,
-            0.7,
-            0,
-            vec![125.0, 5.0, 135.0, 5.0, 135.0, 15.0, 125.0, 15.0],
-        );
-        let out = seg_stitch(vec![a, b, c], &cfg);
+    fn test_nmm_chain_merges_transitively() {
+        // NMM is transitive: A-B + B-C merges the whole chain into one.
+        let cfg = PostprocessConfig::new(0.5, 0.0).with_postprocess_type(PostprocessType::NMM);
+        let out = seg_stitch(chain_abc(), &cfg);
         assert_eq!(out.len(), 1);
         let m = &out[0];
         assert!((m.detection.confidence - 0.9).abs() < 1e-6);
@@ -776,6 +812,21 @@ mod tests {
         let mask = m.mask.as_ref().unwrap();
         assert!(in_mask(mask, 10, 10)); // A's region
         assert!(in_mask(mask, 130, 10)); // C's region -> whole chain merged
+    }
+
+    #[test]
+    fn test_greedy_nmm_chain_keeps_indirect_separate() {
+        // GREEDYNMM matches only the fixed anchor, so C (overlapping the A+B union but
+        // not A) is not pulled into A's group.
+        let cfg =
+            PostprocessConfig::new(0.5, 0.0).with_postprocess_type(PostprocessType::GREEDYNMM);
+        let out = seg_stitch(chain_abc(), &cfg);
+        assert_eq!(out.len(), 2, "C must stay separate from A's group");
+        // No single survivor spans both A's and C's regions.
+        assert!(out.iter().all(|m| {
+            let mask = m.mask.as_ref().unwrap();
+            !(in_mask(mask, 10, 10) && in_mask(mask, 130, 10))
+        }));
     }
 
     #[test]
