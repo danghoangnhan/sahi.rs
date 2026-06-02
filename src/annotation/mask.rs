@@ -414,11 +414,19 @@ fn fill_polygon(mask: &mut [bool], width: usize, height: usize, polygon: &Polygo
             if (y1 <= yf && yf < y2) || (y2 <= yf && yf < y1) {
                 // Edge crosses scanline
                 let x = x1 + (yf - y1) * (x2 - x1) / (y2 - y1);
-                intersections.push(x);
+                // Polygon coords are untrusted (`Mask::new` accepts arbitrary COCO
+                // polygons), so a NaN/inf vertex can yield a non-finite crossing.
+                // Drop it: a non-finite span has no meaningful fill, and keeping it
+                // would corrupt the paired-crossing fill below (issue #47).
+                if x.is_finite() {
+                    intersections.push(x);
+                }
             }
         }
 
-        intersections.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // `partial_cmp` returns `None` for NaN; non-finite crossings are already
+        // dropped above, but fall back to `Equal` so the sort can never panic (#47).
+        intersections.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         // Fill between pairs of intersections
         for pair in intersections.chunks_exact(2) {
@@ -502,6 +510,15 @@ const MOORE_DIRS: [(i32, i32); 8] = [
 /// Trace the outer contour of one component clockwise from `start`, which must be
 /// the top-/left-most pixel of the component (so it was entered from the west).
 /// Returns the ordered ring of pixel coordinates (start not repeated at the end).
+///
+/// Stopping uses **Jacob's criterion** (issue #37): the ring is closed only when the
+/// walker is back on `start` AND the next step it would take goes to the same cell as
+/// the very first step out of `start`. A bare position match (`p == start`) closes
+/// too early for shapes whose outer boundary passes back through the start pixel
+/// before the ring is complete (e.g. a "V" whose apex is the start) — there the naive
+/// stop drops every part of the boundary not yet traced. Tracking the arrival
+/// direction (via the first-step cell) lets the walk pass through the start as many
+/// times as the true contour requires and terminate only on genuine closure.
 fn trace_contour<F: Fn(i32, i32) -> bool>(
     is_fg: &F,
     start_x: i32,
@@ -514,6 +531,10 @@ fn trace_contour<F: Fn(i32, i32) -> bool>(
     // Direction from `p` to the pixel we came from. We arrived at the start from the
     // west, so the clockwise neighbor search begins just past W.
     let mut dir_to_prev = 4usize; // index of W in MOORE_DIRS
+                                  // The first cell stepped to out of `start`. Jacob's criterion: closure happens
+                                  // when we are on `start` and would step to this same cell again (same direction
+                                  // as the original departure), not merely whenever we touch `start`.
+    let mut first_step: Option<(i32, i32)> = None;
 
     for _ in 0..cap {
         let mut next = None;
@@ -529,11 +550,24 @@ fn trace_contour<F: Fn(i32, i32) -> bool>(
             Some(v) => v,
             None => break, // isolated pixel: no foreground neighbor
         };
+        // Jacob's stopping criterion: on `start`, about to repeat the first step.
+        if p == start {
+            if let Some(fs) = first_step {
+                if q == fs {
+                    break; // closed the ring in the same direction it opened
+                }
+            }
+        }
         // From `q`, the pixel we came from (`p`) lies in the opposite direction.
         dir_to_prev = (d + 4) % 8;
+        if first_step.is_none() {
+            first_step = Some(q);
+        }
         p = q;
         if p == start {
-            break; // closed the ring
+            // Re-entered the start mid-trace from a different direction: this is not
+            // closure (Jacob), so keep walking. Do not re-push the start vertex.
+            continue;
         }
         contour.push(p);
     }
@@ -804,5 +838,75 @@ mod tests {
         let mut one = vec![false; 25];
         one[2 * 5 + 2] = true;
         assert!(bool_mask_to_polygons(&one, 5, 5).is_empty());
+    }
+
+    // ---- Jacob's stopping criterion (issue #37) ----
+
+    #[test]
+    fn test_contour_revisits_start_traces_full_ring() {
+        // A "V" whose apex is the raster-order start pixel. The outer boundary
+        // passes back THROUGH the apex between the two arms, so the naive
+        // `if p == start { break; }` stop closes the moment the walker first steps
+        // back onto the apex (after tracing only the right arm), dropping the entire
+        // left arm. Jacob's criterion (stop only when the start is re-entered in the
+        // same direction as the first step) traces the full ring.
+        //
+        // Apex (3,0); right arm (4,1),(5,2),(6,3); left arm (2,1),(1,2),(0,3).
+        let grid = 8usize;
+        let fg = [
+            (3usize, 0usize),
+            (4, 1),
+            (5, 2),
+            (6, 3),
+            (2, 1),
+            (1, 2),
+            (0, 3),
+        ];
+        let mut mask = vec![false; grid * grid];
+        for &(x, y) in &fg {
+            mask[y * grid + x] = true;
+        }
+
+        let polys = bool_mask_to_polygons(&mask, grid as u32, grid as u32);
+        assert_eq!(polys.len(), 1, "single component -> one polygon");
+
+        // Collect the traced pixel coordinates and assert EVERY foreground pixel is
+        // covered. Under the buggy early stop, the left arm is missing.
+        let traced: std::collections::HashSet<(usize, usize)> = polys[0]
+            .chunks_exact(2)
+            .map(|c| (c[0] as usize, c[1] as usize))
+            .collect();
+        for &(x, y) in &fg {
+            assert!(
+                traced.contains(&(x, y)),
+                "foreground pixel {:?} missing from traced contour (early stop?)",
+                (x, y)
+            );
+        }
+    }
+
+    // ---- fill_polygon NaN/inf hardening (issue #47, mask.rs fill_polygon site) ----
+
+    #[test]
+    fn test_to_bool_mask_with_nan_coord_does_not_panic() {
+        // `Mask::new` accepts arbitrary (untrusted) COCO polygons, reachable via the
+        // Python `mask_array`/`MaskedDetection` boundary. A NaN vertex coordinate
+        // produces a NaN scanline x-crossing, and `partial_cmp` on NaN is `None`, so
+        // the old `.unwrap()` in the sort comparator panics. The fill must instead
+        // return without panicking.
+        let segmentation = vec![vec![0.0, 0.0, 10.0, 0.0, f32::NAN, 10.0, 0.0, 10.0]];
+        let mask = Mask::new(segmentation, [20, 20], None);
+        let raster = mask.to_bool_mask();
+        assert_eq!(raster.len(), 20 * 20);
+    }
+
+    #[test]
+    fn test_to_bool_mask_with_infinite_coord_does_not_panic() {
+        // Non-finite (inf) coordinates must also be handled gracefully: a non-finite
+        // x-crossing is dropped rather than producing a corrupted/overflowing fill span.
+        let segmentation = vec![vec![0.0, 0.0, f32::INFINITY, 0.0, 10.0, 10.0, 0.0, 10.0]];
+        let mask = Mask::new(segmentation, [20, 20], None);
+        let raster = mask.to_bool_mask();
+        assert_eq!(raster.len(), 20 * 20);
     }
 }
