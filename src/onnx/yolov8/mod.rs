@@ -38,9 +38,11 @@
 
 mod model;
 mod processor;
+mod seg;
 
 pub use model::{YOLOv8Config, YOLOv8Detector};
 pub use processor::{YOLOv8OutputFormat, YOLOv8Processor};
+pub use seg::{YOLOv8SegConfig, YOLOv8SegDetector, YOLOv8SegProcessor};
 
 // ============================================================================
 // Python Bindings
