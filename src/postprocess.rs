@@ -3,6 +3,7 @@
 //! Supports NMS (Non-Maximum Suppression), NMM (Non-Maximum Merging),
 //! and GREEDYNMM (Greedy Non-Maximum Merging) algorithms.
 
+use crate::combine;
 use crate::detection::{BoundingBox, Detection};
 use crate::slicer::Slice;
 
@@ -96,22 +97,6 @@ impl PostprocessConfig {
 }
 
 /// Calculate Intersection over Smaller area (IOS).
-fn ios(a: &BoundingBox, b: &BoundingBox) -> f32 {
-    let x1 = a.x.max(b.x);
-    let y1 = a.y.max(b.y);
-    let x2 = a.x2().min(b.x2());
-    let y2 = a.y2().min(b.y2());
-
-    let intersection = (x2 - x1).max(0.0) * (y2 - y1).max(0.0);
-    let smaller_area = a.area().min(b.area());
-
-    if smaller_area > 0.0 {
-        intersection / smaller_area
-    } else {
-        0.0
-    }
-}
-
 /// Merge two bounding boxes into one (union).
 fn merge_boxes(a: &BoundingBox, b: &BoundingBox) -> BoundingBox {
     let x1 = a.x.min(b.x);
@@ -139,16 +124,13 @@ impl Postprocessor {
     }
 
     /// Calculate the match score between two boxes based on the configured metric.
-    fn match_score(&self, a: &BoundingBox, b: &BoundingBox) -> f32 {
-        match self.config.match_metric {
-            MatchMetric::IOU => a.iou(b),
-            MatchMetric::IOS => ios(a, b),
+    /// Build the shared match configuration used by the grouping algorithms.
+    fn match_config(&self) -> combine::MatchConfig {
+        combine::MatchConfig {
+            metric: self.config.match_metric,
+            threshold: self.config.match_threshold,
+            class_aware: self.config.class_aware,
         }
-    }
-
-    /// Check if two detections should be processed together (same class if class-aware).
-    fn should_compare(&self, a: &Detection, b: &Detection) -> bool {
-        !self.config.class_aware || a.class_id == b.class_id
     }
 
     /// Stitch detections from multiple slices.
@@ -179,46 +161,15 @@ impl Postprocessor {
     ///
     /// Removes overlapping boxes, keeping only the one with highest confidence.
     pub fn nms(&self, detections: &mut [Detection]) -> Vec<Detection> {
-        if detections.is_empty() {
-            return Vec::new();
-        }
-
-        // Sort by confidence (descending)
-        detections.sort_by(|a, b| {
-            b.confidence
-                .partial_cmp(&a.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        let mut keep = vec![true; detections.len()];
-
-        for i in 0..detections.len() {
-            if !keep[i] {
-                continue;
-            }
-
-            for j in (i + 1)..detections.len() {
-                if !keep[j] {
-                    continue;
-                }
-
-                if !self.should_compare(&detections[i], &detections[j]) {
-                    continue;
-                }
-
-                let score = self.match_score(&detections[i].bbox, &detections[j].bbox);
-                if score > self.config.match_threshold {
-                    keep[j] = false;
-                }
-            }
-        }
-
-        detections
-            .iter()
-            .zip(keep.iter())
-            .filter(|(_, &k)| k)
-            .map(|(d, _)| d.clone())
-            .collect()
+        sort_by_confidence_desc(detections);
+        // Greedy fixed-anchor groups; NMS keeps each group's anchor and suppresses the rest.
+        let groups = combine::greedy_groups(
+            detections.len(),
+            self.match_config(),
+            |i| detections[i].bbox,
+            |i| detections[i].class_id,
+        );
+        groups.iter().map(|g| detections[g[0]].clone()).collect()
     }
 
     /// Apply Non-Maximum Merging to a list of detections.
@@ -228,56 +179,16 @@ impl Postprocessor {
     /// merges {A, B, C} even when A and C do not overlap). Matches reference SAHI's NMM —
     /// looser than [`greedy_nmm`](Self::greedy_nmm), which only merges direct overlaps.
     pub fn nmm(&self, detections: &mut [Detection]) -> Vec<Detection> {
-        if detections.is_empty() {
-            return Vec::new();
-        }
-
-        // Sort by confidence (descending), so the lowest index in each component is its anchor.
-        detections.sort_by(|a, b| {
-            b.confidence
-                .partial_cmp(&a.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        // Union-find over the match graph.
-        let n = detections.len();
-        let mut parent: Vec<usize> = (0..n).collect();
-        for i in 0..n {
-            for j in (i + 1)..n {
-                if !self.should_compare(&detections[i], &detections[j]) {
-                    continue;
-                }
-                if self.match_score(&detections[i].bbox, &detections[j].bbox)
-                    > self.config.match_threshold
-                {
-                    let (ri, rj) = (uf_find(&mut parent, i), uf_find(&mut parent, j));
-                    if ri != rj {
-                        parent[ri] = rj;
-                    }
-                }
-            }
-        }
-
-        // Gather connected components, preserving descending-confidence order.
-        let mut group_of: Vec<Option<usize>> = vec![None; n];
-        let mut groups: Vec<Vec<usize>> = Vec::new();
-        for i in 0..n {
-            let root = uf_find(&mut parent, i);
-            let gi = match group_of[root] {
-                Some(g) => g,
-                None => {
-                    let g = groups.len();
-                    group_of[root] = Some(g);
-                    groups.push(Vec::new());
-                    g
-                }
-            };
-            groups[gi].push(i);
-        }
-
+        sort_by_confidence_desc(detections);
+        let groups = combine::connected_components(
+            detections.len(),
+            self.match_config(),
+            |i| detections[i].bbox,
+            |i| detections[i].class_id,
+        );
         groups
             .iter()
-            .map(|indices| self.merge_detection_group(detections, indices))
+            .map(|g| self.merge_detection_group(detections, g))
             .collect()
     }
 
@@ -288,48 +199,17 @@ impl Postprocessor {
     /// box growth), then merges the group. Matches reference SAHI's GreedyNMM — tighter than
     /// [`nmm`](Self::nmm), which merges transitively.
     pub fn greedy_nmm(&self, detections: &mut [Detection]) -> Vec<Detection> {
-        if detections.is_empty() {
-            return Vec::new();
-        }
-
-        // Sort by confidence (descending)
-        detections.sort_by(|a, b| {
-            b.confidence
-                .partial_cmp(&a.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        let mut result: Vec<Detection> = Vec::new();
-        let mut used = vec![false; detections.len()];
-
-        for i in 0..detections.len() {
-            if used[i] {
-                continue;
-            }
-            used[i] = true;
-
-            // Group every still-unused box that directly overlaps the fixed anchor `i`.
-            let mut group_indices = vec![i];
-            for j in (i + 1)..detections.len() {
-                if used[j] {
-                    continue;
-                }
-
-                if !self.should_compare(&detections[i], &detections[j]) {
-                    continue;
-                }
-
-                let score = self.match_score(&detections[i].bbox, &detections[j].bbox);
-                if score > self.config.match_threshold {
-                    group_indices.push(j);
-                    used[j] = true;
-                }
-            }
-
-            result.push(self.merge_detection_group(detections, &group_indices));
-        }
-
-        result
+        sort_by_confidence_desc(detections);
+        let groups = combine::greedy_groups(
+            detections.len(),
+            self.match_config(),
+            |i| detections[i].bbox,
+            |i| detections[i].class_id,
+        );
+        groups
+            .iter()
+            .map(|g| self.merge_detection_group(detections, g))
+            .collect()
     }
 
     /// Merge a group of detections into one.
@@ -361,19 +241,13 @@ impl Postprocessor {
     }
 }
 
-/// Union-find `find` with path compression (used by transitive NMM).
-fn uf_find(parent: &mut [usize], x: usize) -> usize {
-    let mut root = x;
-    while parent[root] != root {
-        root = parent[root];
-    }
-    let mut cur = x;
-    while parent[cur] != root {
-        let next = parent[cur];
-        parent[cur] = root;
-        cur = next;
-    }
-    root
+/// Sort detections by descending confidence so each group's anchor comes first.
+fn sort_by_confidence_desc(detections: &mut [Detection]) {
+    detections.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 }
 
 #[cfg(test)]
@@ -562,7 +436,7 @@ mod tests {
         let small = BoundingBox::new(25.0, 25.0, 50.0, 50.0);
 
         // Small box fully inside large box: IOS should be 1.0
-        let ios_score = ios(&large, &small);
+        let ios_score = large.ios(&small);
         assert!((ios_score - 1.0).abs() < 1e-6);
 
         // IOU would be much smaller

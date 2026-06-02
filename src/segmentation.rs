@@ -10,10 +10,11 @@
 //! sub-projects (9b, 9c).
 
 use crate::annotation::Mask;
-use crate::detection::{BoundingBox, Detection};
+use crate::combine;
+use crate::detection::Detection;
 use crate::error::Result;
 use crate::inference::ImageData;
-use crate::postprocess::{MatchMetric, PostprocessConfig, PostprocessType};
+use crate::postprocess::{PostprocessConfig, PostprocessType};
 
 /// A detection paired with an optional segmentation mask.
 ///
@@ -132,46 +133,25 @@ pub fn seg_stitch(
     }
 }
 
-/// Bounding-box match score for the configured metric.
-fn match_score(a: &BoundingBox, b: &BoundingBox, metric: MatchMetric) -> f32 {
-    match metric {
-        MatchMetric::IOU => a.iou(b),
-        MatchMetric::IOS => a.ios(b),
+/// Build the shared match configuration from a postprocess config.
+fn match_cfg(config: &PostprocessConfig) -> combine::MatchConfig {
+    combine::MatchConfig {
+        metric: config.match_metric,
+        threshold: config.match_threshold,
+        class_aware: config.class_aware,
     }
 }
 
-/// NMS: keep the highest-confidence box and suppress overlapping same-class boxes;
-/// survivors keep their own mask. Assumes `items` is already sorted by descending
-/// confidence.
+/// NMS: keep each greedy group's anchor (highest confidence), suppressing the rest;
+/// survivors keep their own mask. Assumes `items` is sorted by descending confidence.
 fn seg_nms(items: Vec<MaskedDetection>, config: &PostprocessConfig) -> Vec<MaskedDetection> {
-    let n = items.len();
-    let mut keep = vec![true; n];
-    for i in 0..n {
-        if !keep[i] {
-            continue;
-        }
-        for j in (i + 1)..n {
-            if !keep[j] {
-                continue;
-            }
-            if config.class_aware && items[i].detection.class_id != items[j].detection.class_id {
-                continue;
-            }
-            let score = match_score(
-                &items[i].detection.bbox,
-                &items[j].detection.bbox,
-                config.match_metric,
-            );
-            if score > config.match_threshold {
-                keep[j] = false;
-            }
-        }
-    }
-    items
-        .into_iter()
-        .zip(keep)
-        .filter_map(|(m, k)| k.then_some(m))
-        .collect()
+    let groups = combine::greedy_groups(
+        items.len(),
+        match_cfg(config),
+        |i| items[i].detection.bbox,
+        |i| items[i].detection.class_id,
+    );
+    groups.iter().map(|g| items[g[0]].clone()).collect()
 }
 
 /// NMM: transitive merging. Boxes are linked when their match score exceeds the
@@ -179,43 +159,12 @@ fn seg_nms(items: Vec<MaskedDetection>, config: &PostprocessConfig) -> Vec<Maske
 /// detection (unioned bbox, anchor's max confidence, unioned masks) — so A–B + B–C
 /// merges {A, B, C} even when A and C do not overlap.
 fn seg_nmm(items: Vec<MaskedDetection>, config: &PostprocessConfig) -> Vec<MaskedDetection> {
-    let n = items.len();
-    let mut parent: Vec<usize> = (0..n).collect();
-    for i in 0..n {
-        for j in (i + 1)..n {
-            if config.class_aware && items[i].detection.class_id != items[j].detection.class_id {
-                continue;
-            }
-            let score = match_score(
-                &items[i].detection.bbox,
-                &items[j].detection.bbox,
-                config.match_metric,
-            );
-            if score > config.match_threshold {
-                let (ri, rj) = (uf_find(&mut parent, i), uf_find(&mut parent, j));
-                if ri != rj {
-                    parent[ri] = rj;
-                }
-            }
-        }
-    }
-
-    // Gather connected components, preserving descending-confidence order.
-    let mut group_of: Vec<Option<usize>> = vec![None; n];
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    for i in 0..n {
-        let root = uf_find(&mut parent, i);
-        let gi = match group_of[root] {
-            Some(g) => g,
-            None => {
-                let g = groups.len();
-                group_of[root] = Some(g);
-                groups.push(Vec::new());
-                g
-            }
-        };
-        groups[gi].push(i);
-    }
+    let groups = combine::connected_components(
+        items.len(),
+        match_cfg(config),
+        |i| items[i].detection.bbox,
+        |i| items[i].detection.class_id,
+    );
     groups.iter().map(|g| merge_group(&items, g)).collect()
 }
 
@@ -223,50 +172,13 @@ fn seg_nmm(items: Vec<MaskedDetection>, config: &PostprocessConfig) -> Vec<Maske
 /// box that directly overlaps the **fixed anchor** (no transitive merging, no box
 /// growth), then merges the group. Tighter than [`seg_nmm`].
 fn seg_greedy_nmm(items: Vec<MaskedDetection>, config: &PostprocessConfig) -> Vec<MaskedDetection> {
-    let n = items.len();
-    let mut used = vec![false; n];
-    let mut result = Vec::new();
-    for i in 0..n {
-        if used[i] {
-            continue;
-        }
-        used[i] = true;
-        let mut group = vec![i];
-        for j in (i + 1)..n {
-            if used[j] {
-                continue;
-            }
-            if config.class_aware && items[i].detection.class_id != items[j].detection.class_id {
-                continue;
-            }
-            let score = match_score(
-                &items[i].detection.bbox,
-                &items[j].detection.bbox,
-                config.match_metric,
-            );
-            if score > config.match_threshold {
-                used[j] = true;
-                group.push(j);
-            }
-        }
-        result.push(merge_group(&items, &group));
-    }
-    result
-}
-
-/// Union-find `find` with path compression (used by transitive [`seg_nmm`]).
-fn uf_find(parent: &mut [usize], x: usize) -> usize {
-    let mut root = x;
-    while parent[root] != root {
-        root = parent[root];
-    }
-    let mut cur = x;
-    while parent[cur] != root {
-        let next = parent[cur];
-        parent[cur] = root;
-        cur = next;
-    }
-    root
+    let groups = combine::greedy_groups(
+        items.len(),
+        match_cfg(config),
+        |i| items[i].detection.bbox,
+        |i| items[i].detection.class_id,
+    );
+    groups.iter().map(|g| merge_group(&items, g)).collect()
 }
 
 /// Merge a group of detections (the first is the highest-confidence anchor) into
