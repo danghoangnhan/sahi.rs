@@ -1,0 +1,59 @@
+name: GPU Simulator
+
+# Optional, non-required check. The hosted runners have no GPU, so this runs
+# the CUDA backend tests (hand-written PTX loaded through cudarc) on a
+# simulated NVIDIA H100 (https://github.com/pantheongpu/pantheonsim). A
+# simulator cannot reproduce hardware-specific behavior or timing, so it
+# complements real-GPU testing and does not replace it.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cuda-backend:
+    name: CUDA backend tests (simulated H100)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Set up the simulated GPU
+        uses: pantheongpu/setup-pantheonsim@ca87fe3143b29166822b923d6050945c5179408c # v0.1.5
+        with:
+          gpu: nvidia/h100
+
+      # cudarc loads libcuda at run time, so the build needs no CUDA toolkit
+      # and runs outside the simulator.
+      - name: Build the test binary
+        run: |
+          cargo test --lib --features cuda --no-run -j3 --message-format=json > build.json
+          jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "sahi") | .executable' build.json | tail -n 1 > test-bin.txt
+          test -x "$(cat test-bin.txt)"
+
+      # These tests return early (and still pass) when no device or kernel is
+      # found, so fail the step if any of them printed "Skipping".
+      - name: Run the CUDA backend tests
+        run: |
+          vgpu run "$(cat test-bin.txt)" backend::cuda --nocapture --test-threads=1 2>&1 | tee test.log
+          grep -q "Kernel loaded: true" test.log
+          ! grep -q "Skipping" test.log
